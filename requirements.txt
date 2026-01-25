@@ -1,0 +1,6 @@
+streamlit
+pandas
+opencv-python-headless
+google-genai
+altair
+fpdf    
