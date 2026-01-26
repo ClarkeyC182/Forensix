@@ -11,7 +11,6 @@ from google import genai
 from google.genai import types
 from fpdf import FPDF
 from streamlit_gsheets import GSheetsConnection
-from collections import Counter
 
 # --- CONFIG ---
 st.set_page_config(page_title="Forensix Personal Auditor", page_icon="🕵️‍♂️", layout="wide")
@@ -23,7 +22,6 @@ for d in DIRS.values(): d.mkdir(exist_ok=True)
 def load_data():
     conn = st.connection("gsheets", type=GSheetsConnection)
     try:
-        # Increased columns to 9 to include Sub_Category
         df = conn.read(worksheet="Sheet1", usecols=list(range(9)), ttl=5)
         df = df.dropna(how="all")
         return df
@@ -44,6 +42,7 @@ def vision_slice_micro(image_path):
     img = cv2.imread(str(image_path))
     if img is None: return []
     h, w = img.shape[:2]
+    # Lower threshold to ensure we catch everything
     if h < 1000: return [img]
     slices = []
     slice_height, overlap, start = 1000, 200, 0
@@ -56,22 +55,24 @@ def vision_slice_micro(image_path):
     return slices
 
 def analyze_content(content_bytes, mime_type, client, user_vices):
-    # UPDATED PROMPT: Asks for Vendor explicitly and Tiered Categories
+    # PROMPT V15: Item-Centric Vendor Logic
     prompt = f"""
-    Role: Forensic Auditor. 
-    Task: Identify the Vendor/Store Name and extract EVERY line item.
+    Role: Forensic Auditor.
+    Task: Extract every single line item from the image.
+    IMPORTANT: The image may contain MULTIPLE DISTINCT RECEIPTS. Process ALL of them.
     
-    Categorization Rules:
-    1. Main Category MUST be one of: [Groceries, Dining Out, Alcohol, Transport, Shopping, Utilities, Entertainment, Services, Fees].
-    2. Sub Category: Be specific (e.g., Condiments, Meat, Spices, Bakery, Taxi, Hotel).
-    3. Flag 'is_vice' = true if matches: [{user_vices}].
+    For each item found, identify:
+    1. The Vendor (Store Name) belonging to that specific item's receipt.
+    2. Main Category: [Groceries, Dining Out, Alcohol, Transport, Shopping, Utilities, Entertainment, Services, Fees].
+    3. Sub Category: (e.g. Condiments, Meat, Spices, Bakery, Taxi).
+    4. Vice Check: Set 'is_vice' = true if matches [{user_vices}].
     
     JSON Schema:
     {{
-        "vendor": "Store Name (e.g. Tesco, Uber)", 
-        "items": [ 
-            {{ "name": "...", "price": 0.00, "iva_rate": 0, "main_category": "...", "sub_category": "...", "is_vice": false }} 
-        ] 
+      "items": [
+        {{ "vendor": "Tesco", "name": "Milk", "price": 1.20, "iva_rate": 0, "main_category": "Groceries", "sub_category": "Dairy", "is_vice": false }},
+        {{ "vendor": "Lidl", "name": "Bread", "price": 0.80, "iva_rate": 0, "main_category": "Groceries", "sub_category": "Bakery", "is_vice": false }}
+      ]
     }}
     """
     try:
@@ -81,16 +82,9 @@ def analyze_content(content_bytes, mime_type, client, user_vices):
             config=types.GenerateContentConfig(response_mime_type='application/json')
         )
         data = json.loads(res.text)
-        
-        # Normalize output
-        vendor = data.get("vendor", "Unknown")
-        items = data.get("items", [])
-        
-        # Inject the vendor into every item so we track it per line
-        for i in items:
-            i['vendor'] = vendor
-            
-        return items
+        if isinstance(data, dict):
+            return data.get("items", [])
+        return []
     except: return []
 
 def process_upload(uploaded_file, api_key, user_vices):
@@ -99,7 +93,6 @@ def process_upload(uploaded_file, api_key, user_vices):
     client = genai.Client(api_key=api_key)
     extracted_items = []
     
-    # 1. Extraction Phase
     if uploaded_file.type == "application/pdf":
         with open(temp_path, "rb") as f: 
             extracted_items.extend(analyze_content(f.read(), "application/pdf", client, user_vices))
@@ -108,24 +101,12 @@ def process_upload(uploaded_file, api_key, user_vices):
         bar = st.progress(0)
         for i, s in enumerate(slices):
             _, buf = cv2.imencode(".jpg", s)
+            # Add context that this is slice X of Y
             extracted_items.extend(analyze_content(buf.tobytes(), "image/jpeg", client, user_vices))
             bar.progress((i + 1) / len(slices))
         time.sleep(0.2); bar.empty()
+    
     os.remove(temp_path)
-    
-    # 2. The "Vendor Backfill" Algorithm
-    # If we sliced a receipt, Slice 2 might say Vendor="Unknown". 
-    # We find the most common valid vendor in this file and apply it to the Unknowns.
-    vendors_found = [i.get('vendor') for i in extracted_items if i.get('vendor') and i.get('vendor') != "Unknown"]
-    
-    if vendors_found:
-        # Find the winner (most common name)
-        primary_vendor = Counter(vendors_found).most_common(1)[0][0]
-        # Overwrite any "Unknown" or missing vendors with the winner
-        for i in extracted_items:
-            if i.get('vendor') == "Unknown" or not i.get('vendor'):
-                i['vendor'] = primary_vendor
-                
     return extracted_items
 
 def generate_pdf_safe(df, goal_name):
@@ -137,17 +118,19 @@ def generate_pdf_safe(df, goal_name):
         pdf.set_font("Arial", 'B', 12); pdf.cell(100, 10, f"Total: {df['Amount'].sum():.2f}", 1, 1)
         pdf.set_text_color(200, 0, 0); pdf.cell(100, 10, f"Leakage: {df[df['Is_Vice']==True]['Amount'].sum():.2f}", 1, 1); pdf.set_text_color(0,0,0); pdf.ln(5)
         
-        # Updated Headers for Sub Category
-        pdf.set_font("Arial", 'B', 8)
-        pdf.cell(80, 8, "Item", 1); pdf.cell(20, 8, "Price", 1); pdf.cell(40, 8, "Cat", 1); pdf.cell(40, 8, "Sub-Cat", 1); pdf.ln()
+        pdf.set_font("Arial", 'B', 7) # Smaller font to fit Vendor
+        # Widths: Item(60), Vendor(30), Price(20), Cat(40), Sub(40)
+        pdf.cell(60, 8, "Item", 1); pdf.cell(30, 8, "Vendor", 1); pdf.cell(20, 8, "Price", 1); pdf.cell(40, 8, "Cat", 1); pdf.cell(40, 8, "Sub", 1); pdf.ln()
         
-        pdf.set_font("Arial", '', 8)
+        pdf.set_font("Arial", '', 7)
         for _, row in df.iterrows():
-            safe_name = str(row['Item']).encode('ascii', 'ignore').decode('ascii')[:35]
-            safe_cat = str(row['Category']).encode('ascii', 'ignore').decode('ascii')
-            safe_sub = str(row['Sub_Category']).encode('ascii', 'ignore').decode('ascii')
+            safe_name = str(row['Item']).encode('ascii', 'ignore').decode('ascii')[:30]
+            safe_vend = str(row['Vendor']).encode('ascii', 'ignore').decode('ascii')[:15]
+            safe_cat = str(row['Category']).encode('ascii', 'ignore').decode('ascii')[:15]
+            safe_sub = str(row['Sub_Category']).encode('ascii', 'ignore').decode('ascii')[:15]
             
-            pdf.cell(80, 6, safe_name, 1)
+            pdf.cell(60, 6, safe_name, 1)
+            pdf.cell(30, 6, safe_vend, 1)
             pdf.cell(20, 6, f"{row['Amount']:.2f}", 1)
             pdf.cell(40, 6, safe_cat, 1)
             pdf.cell(40, 6, safe_sub, 1)
@@ -161,7 +144,6 @@ if not api_key: st.stop()
 
 # LOAD DATA
 df = load_data()
-# Updated Required Columns
 required_cols = ["Date", "Vendor", "Item", "Amount", "IVA", "Category", "Sub_Category", "Is_Vice", "File"]
 for c in required_cols:
     if c not in df.columns: df[c] = 0.0 if c in ["Amount", "IVA"] else ""
@@ -205,16 +187,15 @@ if uploaded and st.button("🔍 Run Forensic Audit"):
                 except: price = 0.0
                 iva_rate = item.get('iva_rate', 0)
                 
-                # Default Logic if API misses it
                 cat = item.get('main_category', 'Shopping')
                 if not cat or cat == "Unknown": cat = "Shopping"
                 
-                # Auto-Tax Logic
+                # Auto-Tax
                 if iva_rate == 0 and "alcohol" in str(cat).lower(): iva_rate = 21.0
                 
                 new_rows.append({
                     "Date": pd.Timestamp.now().strftime("%Y-%m-%d"), 
-                    "Vendor": item.get('vendor', 'Unknown'),
+                    "Vendor": item.get('vendor', 'Unknown'), # Extracted PER ITEM
                     "Item": str(item.get('name', 'Item')), 
                     "Amount": price,
                     "IVA": round(price - (price / (1 + (iva_rate / 100))), 2),
@@ -227,24 +208,22 @@ if uploaded and st.button("🔍 Run Forensic Audit"):
         df_new = pd.DataFrame(new_rows)
         updated_df = pd.concat([df, df_new], ignore_index=True)
         save_data(updated_df)
-        st.success("Saved to Cloud!")
+        st.success(f"Saved {len(new_rows)} items to Cloud!")
         time.sleep(1)
         st.rerun()
 
 tab1, tab2 = st.tabs(["📊 Analytics", "📝 Ledger"])
 with tab1:
     if not df.empty:
-        # MAIN CATEGORY CHART
         chart = alt.Chart(df.groupby("Category")["Amount"].sum().reset_index()).mark_bar().encode(
             x=alt.X('Category', sort='-y'), y='Amount', color='Category', tooltip=['Category', 'Amount']
         ).properties(height=350, title="Spend by Main Category")
         st.altair_chart(chart, use_container_width=True)
         
-        # SUB CATEGORY DRILLDOWN
         st.markdown("### 🔍 Drill Down")
         chart_sub = alt.Chart(df.groupby("Sub_Category")["Amount"].sum().reset_index()).mark_bar().encode(
             x=alt.X('Amount'), y=alt.Y('Sub_Category', sort='-x'), tooltip=['Sub_Category', 'Amount']
-        ).properties(height=400, title="Spend by Detail (Sub-Category)")
+        ).properties(height=400, title="Spend by Detail")
         st.altair_chart(chart_sub, use_container_width=True)
 
 with tab2:
@@ -253,4 +232,4 @@ with tab2:
         if st.button("💾 Sync to Cloud"):
             save_data(edited_df)
             st.success("Synced!")
-            
+
