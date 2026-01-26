@@ -11,6 +11,7 @@ from google import genai
 from google.genai import types
 from fpdf import FPDF
 from streamlit_gsheets import GSheetsConnection
+from collections import Counter
 
 # --- CONFIG ---
 st.set_page_config(page_title="Forensix Personal Auditor", page_icon="🕵️‍♂️", layout="wide")
@@ -20,19 +21,17 @@ for d in DIRS.values(): d.mkdir(exist_ok=True)
 
 # --- DATABASE CONNECTION ---
 def load_data():
-    # Looks for 'spreadsheet' in secrets first
     conn = st.connection("gsheets", type=GSheetsConnection)
     try:
-        df = conn.read(worksheet="Sheet1", usecols=list(range(8)), ttl=5)
+        # Increased columns to 9 to include Sub_Category
+        df = conn.read(worksheet="Sheet1", usecols=list(range(9)), ttl=5)
         df = df.dropna(how="all")
         return df
     except Exception:
-        # Fallback if empty or new sheet
-        return pd.DataFrame(columns=["Date", "Vendor", "Item", "Amount", "IVA", "Category", "Is_Vice", "File"])
+        return pd.DataFrame(columns=["Date", "Vendor", "Item", "Amount", "IVA", "Category", "Sub_Category", "Is_Vice", "File"])
 
 def save_data(df):
     conn = st.connection("gsheets", type=GSheetsConnection)
-    # This triggers the actual write to cloud
     conn.update(worksheet="Sheet1", data=df)
 
 # --- AUTHENTICATION ---
@@ -57,10 +56,23 @@ def vision_slice_micro(image_path):
     return slices
 
 def analyze_content(content_bytes, mime_type, client, user_vices):
+    # UPDATED PROMPT: Asks for Vendor explicitly and Tiered Categories
     prompt = f"""
-    Role: Forensic Auditor. Task: Extract EVERY line item.
-    Rules: 1. Output strictly JSON. 2. Categorize items. 3. Flag 'is_vice' if matches [{user_vices}].
-    JSON Schema: {{ "items": [ {{ "name": "...", "price": 0.00, "iva_rate": 0, "category": "...", "is_vice": false }} ] }}
+    Role: Forensic Auditor. 
+    Task: Identify the Vendor/Store Name and extract EVERY line item.
+    
+    Categorization Rules:
+    1. Main Category MUST be one of: [Groceries, Dining Out, Alcohol, Transport, Shopping, Utilities, Entertainment, Services, Fees].
+    2. Sub Category: Be specific (e.g., Condiments, Meat, Spices, Bakery, Taxi, Hotel).
+    3. Flag 'is_vice' = true if matches: [{user_vices}].
+    
+    JSON Schema:
+    {{
+        "vendor": "Store Name (e.g. Tesco, Uber)", 
+        "items": [ 
+            {{ "name": "...", "price": 0.00, "iva_rate": 0, "main_category": "...", "sub_category": "...", "is_vice": false }} 
+        ] 
+    }}
     """
     try:
         res = client.models.generate_content(
@@ -69,9 +81,16 @@ def analyze_content(content_bytes, mime_type, client, user_vices):
             config=types.GenerateContentConfig(response_mime_type='application/json')
         )
         data = json.loads(res.text)
-        if isinstance(data, list): return data
-        if isinstance(data, dict): return data.get("items", []) or data.get("receipts", []) or []
-        return []
+        
+        # Normalize output
+        vendor = data.get("vendor", "Unknown")
+        items = data.get("items", [])
+        
+        # Inject the vendor into every item so we track it per line
+        for i in items:
+            i['vendor'] = vendor
+            
+        return items
     except: return []
 
 def process_upload(uploaded_file, api_key, user_vices):
@@ -80,10 +99,10 @@ def process_upload(uploaded_file, api_key, user_vices):
     client = genai.Client(api_key=api_key)
     extracted_items = []
     
-    # PDF Handler
+    # 1. Extraction Phase
     if uploaded_file.type == "application/pdf":
-        with open(temp_path, "rb") as f: extracted_items.extend(analyze_content(f.read(), "application/pdf", client, user_vices))
-    # Image Handler
+        with open(temp_path, "rb") as f: 
+            extracted_items.extend(analyze_content(f.read(), "application/pdf", client, user_vices))
     else:
         slices = vision_slice_micro(temp_path)
         bar = st.progress(0)
@@ -93,6 +112,20 @@ def process_upload(uploaded_file, api_key, user_vices):
             bar.progress((i + 1) / len(slices))
         time.sleep(0.2); bar.empty()
     os.remove(temp_path)
+    
+    # 2. The "Vendor Backfill" Algorithm
+    # If we sliced a receipt, Slice 2 might say Vendor="Unknown". 
+    # We find the most common valid vendor in this file and apply it to the Unknowns.
+    vendors_found = [i.get('vendor') for i in extracted_items if i.get('vendor') and i.get('vendor') != "Unknown"]
+    
+    if vendors_found:
+        # Find the winner (most common name)
+        primary_vendor = Counter(vendors_found).most_common(1)[0][0]
+        # Overwrite any "Unknown" or missing vendors with the winner
+        for i in extracted_items:
+            if i.get('vendor') == "Unknown" or not i.get('vendor'):
+                i['vendor'] = primary_vendor
+                
     return extracted_items
 
 def generate_pdf_safe(df, goal_name):
@@ -103,12 +136,22 @@ def generate_pdf_safe(df, goal_name):
         pdf.set_font("Arial", size=10); pdf.cell(190, 10, f"Goal: {goal_name}", 0, 1, 'C'); pdf.ln(10)
         pdf.set_font("Arial", 'B', 12); pdf.cell(100, 10, f"Total: {df['Amount'].sum():.2f}", 1, 1)
         pdf.set_text_color(200, 0, 0); pdf.cell(100, 10, f"Leakage: {df[df['Is_Vice']==True]['Amount'].sum():.2f}", 1, 1); pdf.set_text_color(0,0,0); pdf.ln(5)
-        pdf.set_font("Arial", 'B', 8); pdf.cell(100, 8, "Item", 1); pdf.cell(30, 8, "Price", 1); pdf.cell(50, 8, "Cat", 1); pdf.ln()
+        
+        # Updated Headers for Sub Category
+        pdf.set_font("Arial", 'B', 8)
+        pdf.cell(80, 8, "Item", 1); pdf.cell(20, 8, "Price", 1); pdf.cell(40, 8, "Cat", 1); pdf.cell(40, 8, "Sub-Cat", 1); pdf.ln()
+        
         pdf.set_font("Arial", '', 8)
         for _, row in df.iterrows():
-            safe_name = str(row['Item']).encode('ascii', 'ignore').decode('ascii')[:40]
+            safe_name = str(row['Item']).encode('ascii', 'ignore').decode('ascii')[:35]
             safe_cat = str(row['Category']).encode('ascii', 'ignore').decode('ascii')
-            pdf.cell(100, 6, safe_name, 1); pdf.cell(30, 6, f"{row['Amount']:.2f}", 1); pdf.cell(50, 6, safe_cat, 1); pdf.ln()
+            safe_sub = str(row['Sub_Category']).encode('ascii', 'ignore').decode('ascii')
+            
+            pdf.cell(80, 6, safe_name, 1)
+            pdf.cell(20, 6, f"{row['Amount']:.2f}", 1)
+            pdf.cell(40, 6, safe_cat, 1)
+            pdf.cell(40, 6, safe_sub, 1)
+            pdf.ln()
         return pdf.output(dest='S').encode('latin-1')
     except: return None
 
@@ -118,7 +161,8 @@ if not api_key: st.stop()
 
 # LOAD DATA
 df = load_data()
-required_cols = ["Date", "Vendor", "Item", "Amount", "IVA", "Category", "Is_Vice", "File"]
+# Updated Required Columns
+required_cols = ["Date", "Vendor", "Item", "Amount", "IVA", "Category", "Sub_Category", "Is_Vice", "File"]
 for c in required_cols:
     if c not in df.columns: df[c] = 0.0 if c in ["Amount", "IVA"] else ""
 
@@ -160,16 +204,27 @@ if uploaded and st.button("🔍 Run Forensic Audit"):
                 try: price = float(item.get('price', 0))
                 except: price = 0.0
                 iva_rate = item.get('iva_rate', 0)
-                if iva_rate == 0 and "alcohol" in str(item.get('category','')).lower(): iva_rate = 21.0
+                
+                # Default Logic if API misses it
+                cat = item.get('main_category', 'Shopping')
+                if not cat or cat == "Unknown": cat = "Shopping"
+                
+                # Auto-Tax Logic
+                if iva_rate == 0 and "alcohol" in str(cat).lower(): iva_rate = 21.0
+                
                 new_rows.append({
-                    "Date": pd.Timestamp.now().strftime("%Y-%m-%d"), "Vendor": item.get('vendor', 'Unknown'),
-                    "Item": str(item.get('name', 'Item')), "Amount": price,
+                    "Date": pd.Timestamp.now().strftime("%Y-%m-%d"), 
+                    "Vendor": item.get('vendor', 'Unknown'),
+                    "Item": str(item.get('name', 'Item')), 
+                    "Amount": price,
                     "IVA": round(price - (price / (1 + (iva_rate / 100))), 2),
-                    "Category": item.get('category', 'Shopping'), "Is_Vice": item.get('is_vice', False), "File": f.name
+                    "Category": cat,
+                    "Sub_Category": item.get('sub_category', 'General'),
+                    "Is_Vice": item.get('is_vice', False), 
+                    "File": f.name
                 })
     if new_rows:
         df_new = pd.DataFrame(new_rows)
-        # Use simple concat to avoid deprecation warnings
         updated_df = pd.concat([df, df_new], ignore_index=True)
         save_data(updated_df)
         st.success("Saved to Cloud!")
@@ -179,15 +234,23 @@ if uploaded and st.button("🔍 Run Forensic Audit"):
 tab1, tab2 = st.tabs(["📊 Analytics", "📝 Ledger"])
 with tab1:
     if not df.empty:
+        # MAIN CATEGORY CHART
         chart = alt.Chart(df.groupby("Category")["Amount"].sum().reset_index()).mark_bar().encode(
-            x=alt.X('Category', sort='-y'), y='Amount', color='Category'
-        ).properties(height=350)
-        # Fix: use use_container_width=True (standard for streamlit)
+            x=alt.X('Category', sort='-y'), y='Amount', color='Category', tooltip=['Category', 'Amount']
+        ).properties(height=350, title="Spend by Main Category")
         st.altair_chart(chart, use_container_width=True)
+        
+        # SUB CATEGORY DRILLDOWN
+        st.markdown("### 🔍 Drill Down")
+        chart_sub = alt.Chart(df.groupby("Sub_Category")["Amount"].sum().reset_index()).mark_bar().encode(
+            x=alt.X('Amount'), y=alt.Y('Sub_Category', sort='-x'), tooltip=['Sub_Category', 'Amount']
+        ).properties(height=400, title="Spend by Detail (Sub-Category)")
+        st.altair_chart(chart_sub, use_container_width=True)
+
 with tab2:
     if not df.empty:
-        # Fix: use use_container_width=True
         edited_df = st.data_editor(df, num_rows="dynamic", use_container_width=True)
         if st.button("💾 Sync to Cloud"):
             save_data(edited_df)
             st.success("Synced!")
+            
