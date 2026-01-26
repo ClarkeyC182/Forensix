@@ -10,20 +10,32 @@ from pathlib import Path
 from google import genai
 from google.genai import types
 from fpdf import FPDF
+from streamlit_gsheets import GSheetsConnection
 
 # --- CONFIG ---
 st.set_page_config(page_title="Forensix Personal Auditor", page_icon="🕵️‍♂️", layout="wide")
 BASE_DIR = Path(__file__).parent.absolute()
-DIRS = { "TEMP": BASE_DIR / "temp_uploads", "REPORTS": BASE_DIR / "audit_reports" }
+DIRS = { "TEMP": BASE_DIR / "temp_uploads" }
 for d in DIRS.values(): d.mkdir(exist_ok=True)
-DATA_FILE = "forensix_ledger_master.csv"
 
-# --- AUTHENTICATION (SECURE) ---
+# --- DATABASE CONNECTION ---
+def load_data():
+    conn = st.connection("gsheets", type=GSheetsConnection)
+    try:
+        # Read the sheet. If empty, return structure
+        df = conn.read(worksheet="Sheet1", usecols=list(range(8)), ttl=5)
+        df = df.dropna(how="all")
+        return df
+    except:
+        return pd.DataFrame(columns=["Date", "Vendor", "Item", "Amount", "IVA", "Category", "Is_Vice", "File"])
+
+def save_data(df):
+    conn = st.connection("gsheets", type=GSheetsConnection)
+    conn.update(worksheet="Sheet1", data=df)
+
+# --- AUTHENTICATION ---
 def get_api_key():
-    # Try to get from Streamlit Secrets (Cloud)
-    if "GEMINI_API_KEY" in st.secrets:
-        return st.secrets["GEMINI_API_KEY"]
-    # Fallback for local testing (Optional: Set env var locally)
+    if "GEMINI_API_KEY" in st.secrets: return st.secrets["GEMINI_API_KEY"]
     return ""
 
 # --- ENGINE ---
@@ -58,24 +70,16 @@ def analyze_content(content_bytes, mime_type, client, user_vices):
         if isinstance(data, list): return data
         if isinstance(data, dict): return data.get("items", []) or data.get("receipts", []) or []
         return []
-    except Exception as e:
-        print(f"AI Error: {e}")
-        return []
+    except: return []
 
 def process_upload(uploaded_file, api_key, user_vices):
-    # Save to temp
     temp_path = DIRS['TEMP'] / uploaded_file.name
     with open(temp_path, "wb") as f: f.write(uploaded_file.getbuffer())
-    
     client = genai.Client(api_key=api_key)
     extracted_items = []
     
-    # PDF LOGIC (Explicitly Supported)
     if uploaded_file.type == "application/pdf":
-        with open(temp_path, "rb") as f: 
-            extracted_items.extend(analyze_content(f.read(), "application/pdf", client, user_vices))
-    
-    # IMAGE LOGIC
+        with open(temp_path, "rb") as f: extracted_items.extend(analyze_content(f.read(), "application/pdf", client, user_vices))
     else:
         slices = vision_slice_micro(temp_path)
         bar = st.progress(0)
@@ -84,7 +88,6 @@ def process_upload(uploaded_file, api_key, user_vices):
             extracted_items.extend(analyze_content(buf.tobytes(), "image/jpeg", client, user_vices))
             bar.progress((i + 1) / len(slices))
         time.sleep(0.2); bar.empty()
-        
     os.remove(temp_path)
     return extracted_items
 
@@ -94,12 +97,8 @@ def generate_pdf_safe(df, goal_name):
         pdf.add_page()
         pdf.set_font("Arial", 'B', 16); pdf.cell(190, 10, "FORENSIX REPORT", 0, 1, 'C')
         pdf.set_font("Arial", size=10); pdf.cell(190, 10, f"Goal: {goal_name}", 0, 1, 'C'); pdf.ln(10)
-        
-        pdf.set_font("Arial", 'B', 12)
-        pdf.cell(100, 10, f"Total: {df['Amount'].sum():.2f}", 1, 1)
-        pdf.set_text_color(200, 0, 0); pdf.cell(100, 10, f"Leakage: {df[df['Is_Vice']==True]['Amount'].sum():.2f}", 1, 1); pdf.set_text_color(0,0,0)
-        pdf.ln(5)
-        
+        pdf.set_font("Arial", 'B', 12); pdf.cell(100, 10, f"Total: {df['Amount'].sum():.2f}", 1, 1)
+        pdf.set_text_color(200, 0, 0); pdf.cell(100, 10, f"Leakage: {df[df['Is_Vice']==True]['Amount'].sum():.2f}", 1, 1); pdf.set_text_color(0,0,0); pdf.ln(5)
         pdf.set_font("Arial", 'B', 8); pdf.cell(100, 8, "Item", 1); pdf.cell(30, 8, "Price", 1); pdf.cell(50, 8, "Cat", 1); pdf.ln()
         pdf.set_font("Arial", '', 8)
         for _, row in df.iterrows():
@@ -110,40 +109,33 @@ def generate_pdf_safe(df, goal_name):
     except: return None
 
 # --- UI ---
-if os.path.exists(DATA_FILE):
-    df = pd.read_csv(DATA_FILE)
-    for c in ["Date", "Vendor", "Item", "Amount", "IVA", "Category", "Is_Vice", "File"]:
-        if c not in df.columns: df[c] = 0 if c in ["Amount", "IVA"] else ""
-else:
-    df = pd.DataFrame(columns=["Date", "Vendor", "Item", "Amount", "IVA", "Category", "Is_Vice", "File"])
+api_key = get_api_key()
+if not api_key: st.stop()
+
+# LOAD DATA FROM SHEETS
+df = load_data()
+# Ensure columns exist
+required_cols = ["Date", "Vendor", "Item", "Amount", "IVA", "Category", "Is_Vice", "File"]
+for c in required_cols:
+    if c not in df.columns: df[c] = 0.0 if c in ["Amount", "IVA"] else ""
 
 with st.sidebar:
     st.title("👤 Profile")
-    
-    # API KEY HANDLING
-    api_key = get_api_key()
-    if not api_key:
-        st.error("⚠️ API Key Missing! Add 'GEMINI_API_KEY' to Streamlit Secrets.")
-        st.stop()
-    else:
-        st.success("🔒 Secure Connection Active")
-
+    st.success("☁️ Database Connected")
     goal_name = st.text_input("Goal Name", "Daughter's New Bike")
     goal_target = st.number_input("Target (€)", value=150.0, step=50.0)
     user_vices_input = st.text_area("Vices", "tobacco, alcohol, bet, lottery, mcdonalds, candy, game", height=100)
     st.markdown("---")
-    
-    # EXPORTS
     if not df.empty:
-        st.write("## 📥 Export Data")
+        st.write("## 📥 Export")
         csv_data = df.to_csv(index=False).encode('utf-8')
         st.download_button("📊 Download CSV", csv_data, "data.csv", "text/csv")
         pdf_data = generate_pdf_safe(df, goal_name)
         if pdf_data: st.download_button("📄 Download PDF", pdf_data, "report.pdf", "application/pdf")
-    
     st.markdown("---")
-    if st.button("⚠️ Clear Data"):
-        if os.path.exists(DATA_FILE): os.remove(DATA_FILE)
+    if st.button("⚠️ Clear Database"):
+        empty_df = pd.DataFrame(columns=required_cols)
+        save_data(empty_df)
         st.rerun()
 
 st.title(f"🎯 Project: {goal_name}")
@@ -155,9 +147,7 @@ progress = min((df[df['Is_Vice']==True]['Amount'].sum() / goal_target) * 100, 10
 col4.metric("Goal Progress", f"{progress:.1f}%")
 st.progress(progress / 100)
 
-# UPLOAD SECTION (PDF SUPPORTED)
 uploaded = st.file_uploader("Upload Receipts", accept_multiple_files=True, type=['png', 'jpg', 'jpeg', 'pdf'])
-
 if uploaded and st.button("🔍 Run Forensic Audit"):
     new_rows = []
     for f in uploaded:
@@ -175,8 +165,12 @@ if uploaded and st.button("🔍 Run Forensic Audit"):
                     "Category": item.get('category', 'Shopping'), "Is_Vice": item.get('is_vice', False), "File": f.name
                 })
     if new_rows:
-        df = pd.concat([df, pd.DataFrame(new_rows)], ignore_index=True)
-        df.to_csv(DATA_FILE, index=False)
+        df_new = pd.DataFrame(new_rows)
+        # Combine and Save to Cloud
+        updated_df = pd.concat([df, df_new], ignore_index=True)
+        save_data(updated_df)
+        st.success("Saved to Cloud!")
+        time.sleep(1)
         st.rerun()
 
 tab1, tab2 = st.tabs(["📊 Analytics", "📝 Ledger"])
@@ -189,7 +183,7 @@ with tab1:
 with tab2:
     if not df.empty:
         edited_df = st.data_editor(df, num_rows="dynamic", use_container_width=True)
-        if st.button("💾 Save Ledger"):
-            edited_df.to_csv(DATA_FILE, index=False)
-            st.rerun()
+        if st.button("💾 Sync to Cloud"):
+            save_data(edited_df)
+            st.success("Synced!")
             
