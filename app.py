@@ -20,17 +20,19 @@ for d in DIRS.values(): d.mkdir(exist_ok=True)
 
 # --- DATABASE CONNECTION ---
 def load_data():
+    # Looks for 'spreadsheet' in secrets first
     conn = st.connection("gsheets", type=GSheetsConnection)
     try:
-        # Read the sheet. If empty, return structure
         df = conn.read(worksheet="Sheet1", usecols=list(range(8)), ttl=5)
         df = df.dropna(how="all")
         return df
-    except:
+    except Exception:
+        # Fallback if empty or new sheet
         return pd.DataFrame(columns=["Date", "Vendor", "Item", "Amount", "IVA", "Category", "Is_Vice", "File"])
 
 def save_data(df):
     conn = st.connection("gsheets", type=GSheetsConnection)
+    # This triggers the actual write to cloud
     conn.update(worksheet="Sheet1", data=df)
 
 # --- AUTHENTICATION ---
@@ -78,8 +80,10 @@ def process_upload(uploaded_file, api_key, user_vices):
     client = genai.Client(api_key=api_key)
     extracted_items = []
     
+    # PDF Handler
     if uploaded_file.type == "application/pdf":
         with open(temp_path, "rb") as f: extracted_items.extend(analyze_content(f.read(), "application/pdf", client, user_vices))
+    # Image Handler
     else:
         slices = vision_slice_micro(temp_path)
         bar = st.progress(0)
@@ -112,9 +116,8 @@ def generate_pdf_safe(df, goal_name):
 api_key = get_api_key()
 if not api_key: st.stop()
 
-# LOAD DATA FROM SHEETS
+# LOAD DATA
 df = load_data()
-# Ensure columns exist
 required_cols = ["Date", "Vendor", "Item", "Amount", "IVA", "Category", "Is_Vice", "File"]
 for c in required_cols:
     if c not in df.columns: df[c] = 0.0 if c in ["Amount", "IVA"] else ""
@@ -166,7 +169,7 @@ if uploaded and st.button("🔍 Run Forensic Audit"):
                 })
     if new_rows:
         df_new = pd.DataFrame(new_rows)
-        # Combine and Save to Cloud
+        # Use simple concat to avoid deprecation warnings
         updated_df = pd.concat([df, df_new], ignore_index=True)
         save_data(updated_df)
         st.success("Saved to Cloud!")
@@ -179,11 +182,12 @@ with tab1:
         chart = alt.Chart(df.groupby("Category")["Amount"].sum().reset_index()).mark_bar().encode(
             x=alt.X('Category', sort='-y'), y='Amount', color='Category'
         ).properties(height=350)
+        # Fix: use use_container_width=True (standard for streamlit)
         st.altair_chart(chart, use_container_width=True)
 with tab2:
     if not df.empty:
+        # Fix: use use_container_width=True
         edited_df = st.data_editor(df, num_rows="dynamic", use_container_width=True)
         if st.button("💾 Sync to Cloud"):
             save_data(edited_df)
             st.success("Synced!")
-            
