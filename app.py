@@ -42,9 +42,10 @@ def vision_slice_micro(image_path):
     img = cv2.imread(str(image_path))
     if img is None: return []
     h, w = img.shape[:2]
-    if h < 1000: return [img]
+    # Slice slightly smaller (900px) to ensure JSON never gets too big per chunk
+    if h < 900: return [img]
     slices = []
-    slice_height, overlap, start = 1000, 200, 0
+    slice_height, overlap, start = 900, 150, 0
     while start < h:
         end = min(start + slice_height, h)
         if (end - start) < 100 and len(slices) > 0: break 
@@ -54,11 +55,18 @@ def vision_slice_micro(image_path):
     return slices
 
 def analyze_content(content_bytes, mime_type, client, user_vices):
+    # TOKEN DIET PROMPT: Uses short keys to prevent JSON cutoff
     prompt = f"""
-    Role: Forensic Auditor. Task: Extract line items.
+    Role: Forensic Auditor. Extract ALL items.
     Context: Image may contain multiple receipts.
-    Output JSON: {{ "items": [ {{ "vendor": "Name (or Unknown)", "name": "Item", "price": 0.00, "iva_rate": 0, "main_category": "Groceries/Dining/etc", "sub_category": "Specific", "is_vice": false }} ] }}
-    Vice Keywords: {user_vices}
+    Output JSON keys: n=name, p=price, v=vendor, mc=main_category, sc=sub_category, vice=is_vice(bool).
+    
+    Rules:
+    1. If vendor is unknown, use null.
+    2. Main Cat: [Groceries, Dining, Alcohol, Transport, Shopping, Utils, Services].
+    3. Vice Keywords: {user_vices}
+    
+    JSON Schema: {{ "items": [ {{ "v": "Tesco", "n": "Milk", "p": 1.20, "mc": "Groceries", "sc": "Dairy", "vice": false }} ] }}
     """
     try:
         res = client.models.generate_content(
@@ -67,7 +75,20 @@ def analyze_content(content_bytes, mime_type, client, user_vices):
             config=types.GenerateContentConfig(response_mime_type='application/json')
         )
         data = json.loads(res.text)
-        return data.get("items", []) if isinstance(data, dict) else []
+        items = data.get("items", []) if isinstance(data, dict) else []
+        
+        # INFLATE KEYS (De-compression)
+        clean_items = []
+        for i in items:
+            clean_items.append({
+                "vendor": i.get("v", "Unknown"),
+                "name": i.get("n", "Item"),
+                "price": i.get("p", 0.0),
+                "main_category": i.get("mc", "Shopping"),
+                "sub_category": i.get("sc", "General"),
+                "is_vice": i.get("vice", False)
+            })
+        return clean_items
     except: return []
 
 def process_upload(uploaded_file, api_key, user_vices):
@@ -88,25 +109,17 @@ def process_upload(uploaded_file, api_key, user_vices):
         time.sleep(0.2); bar.empty()
     os.remove(temp_path)
     
-    # --- ROLLING CONTEXT ALGORITHM ---
-    # Convert to DataFrame to use "Forward Fill" logic
+    # --- ROLLING CONTEXT V2 ---
     if extracted_items:
         df_temp = pd.DataFrame(extracted_items)
-        
-        # 1. Clean "Unknown" to be NaN (Empty) so we can fill over it
         if 'vendor' in df_temp.columns:
-            df_temp['vendor'] = df_temp['vendor'].replace(["Unknown", "unknown", ""], np.nan)
+            # Normalize "Unknown"
+            df_temp['vendor'] = df_temp['vendor'].replace(["Unknown", "unknown", "null", None], np.nan)
             
-            # 2. Forward Fill: If row 1 is Tesco, row 2 (NaN) becomes Tesco
-            df_temp['vendor'] = df_temp['vendor'].ffill()
-            
-            # 3. Backward Fill: If row 1 is NaN, but row 2 is Tesco, row 1 becomes Tesco
-            df_temp['vendor'] = df_temp['vendor'].bfill()
-            
-            # 4. Final sweep: If still NaN, call it "Unknown"
+            # Smart Fill (Forward and Backward)
+            df_temp['vendor'] = df_temp['vendor'].ffill().bfill()
             df_temp['vendor'] = df_temp['vendor'].fillna("Unknown")
             
-            # Convert back to list of dicts
             return df_temp.to_dict('records')
             
     return extracted_items
@@ -190,17 +203,15 @@ if uploaded and st.button("🔍 Run Forensic Audit"):
                 })
     if new_rows:
         df_new = pd.DataFrame(new_rows)
-        # PASSIVE REVIEW: Show what we found, saving happens automatically.
         st.success(f"Processing Complete! Found {len(new_rows)} items.")
-        st.dataframe(df_new) # Show the user what was found immediately
-        
+        st.dataframe(df_new)
         updated_df = pd.concat([df, df_new], ignore_index=True)
         save_data(updated_df)
-        st.toast("Saved to Cloud!", icon="☁️") # Non-intrusive notification
+        st.toast("Saved to Cloud!", icon="☁️")
         time.sleep(2)
         st.rerun()
 
-# [Charts and Editor Code Remains the Same]
+# [Tabs Logic Remains Same]
 tab1, tab2 = st.tabs(["📊 Analytics", "📝 Ledger"])
 with tab1:
     if not df.empty:
@@ -220,4 +231,4 @@ with tab2:
         if st.button("💾 Sync to Cloud"):
             save_data(edited_df)
             st.success("Synced!")
-
+            
