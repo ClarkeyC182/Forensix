@@ -5,8 +5,8 @@ import cv2
 import json
 import os
 import uuid
-import re  # <--- Added back (Fixes Tax Calc)
-import altair as alt # <--- Added back (Fixes Charts)
+import re
+import altair as alt
 from pathlib import Path
 from google import genai
 from google.genai import types
@@ -14,6 +14,7 @@ from fpdf import FPDF
 from streamlit_gsheets import GSheetsConnection
 import numpy as np
 from datetime import datetime
+from PIL import Image
 
 # --- CONFIG ---
 st.set_page_config(page_title="Forensix Personal Auditor", page_icon="🕵️‍♂️", layout="wide")
@@ -24,7 +25,7 @@ for d in DIRS.values(): d.mkdir(exist_ok=True)
 # CONSTANTS
 REQUIRED_COLS = ["Date", "Vendor", "Item", "Amount", "Currency", "IVA", "Category", "Sub_Category", "Is_Vice", "File"]
 
-# --- HELPER: SAFE TYPE CONVERTERS ---
+# --- HELPER: SAFE TYPES ---
 def safe_float(val):
     try:
         if val is None: return 0.0
@@ -101,29 +102,33 @@ def get_api_key():
     if "GEMINI_API_KEY" in st.secrets: return st.secrets["GEMINI_API_KEY"]
     return ""
 
-def vision_slice_micro(image_path):
-    img = cv2.imread(str(image_path))
-    if img is None: return []
-    h, w = img.shape[:2]
-    if h < 1000: return [img]
-    slices, start = [], 0
-    while start < h:
-        end = min(start + 1000, h)
-        if (end - start) < 100 and len(slices) > 0: break 
-        slices.append(img[start:end, :])
-        if end == h: break
-        start += 800
-    return slices
+def resize_image_if_needed(image_path):
+    """Resizes very large images to fit Gemini's limits while keeping clarity"""
+    try:
+        with Image.open(image_path) as img:
+            # Resize if width > 3000 to save tokens, but keep aspect ratio
+            if img.width > 3000:
+                ratio = 3000 / img.width
+                new_height = int(img.height * ratio)
+                img = img.resize((3000, new_height), Image.Resampling.LANCZOS)
+                img.save(image_path, optimize=True, quality=85)
+    except: pass
 
-def analyze_chunk(content_bytes, mime_type, client, user_vices, home_currency):
+def analyze_full_image(content_bytes, mime_type, client, user_vices, home_currency):
+    # COLLAGE-AWARE PROMPT
     prompt = f"""
-    Role: Forensic Auditor. Extract items.
-    JSON Format: [{{ "d": "YYYY-MM-DD", "v": "Vendor", "n": "Item", "p": 1.00, "c": "£", "mc": "Category", "sc": "Sub", "vice": false }}]
-    Rules: 
-    1. IGNORE 'Total', 'Subtotal', 'Card'.
-    2. Date: Use main date or null. NO 'YYYY-MM-DD'.
-    3. Currency default {home_currency}. 
-    4. Vice keywords: {user_vices}.
+    Role: Forensic Auditor.
+    Context: The image contains MULTIPLE separate receipts arranged in a collage.
+    Task: Scan the ENTIRE image. Identify each distinct receipt. Extract items for each receipt separately.
+    
+    JSON: [{{ "d": "YYYY-MM-DD", "v": "Vendor", "n": "Item", "p": 1.00, "c": "£", "mc": "Category", "sc": "Sub", "vice": false }}]
+    
+    CRITICAL RULES:
+    1. **NO TOTALS:** Ignore lines saying 'Total', 'Subtotal', 'Balance', 'Change', 'Cash', 'Card'.
+    2. **VENDOR:** Identify the vendor for EACH item based on which receipt paper it is on. Do not assume one vendor for the whole image.
+    3. **DATE:** Find the date on EACH specific receipt.
+    4. **CURRENCY:** Default {home_currency}. 
+    5. **VICES:** Check: {user_vices}.
     """
     try:
         res = client.models.generate_content(
@@ -144,35 +149,43 @@ def process_upload(uploaded_file, api_key, user_vices, home_currency):
     temp_path = DIRS['TEMP'] / unique_name
     
     with open(temp_path, "wb") as f: f.write(uploaded_file.getbuffer())
+    
+    # Resize to ensure we don't hit 20MB limit if strict
+    if uploaded_file.type != "application/pdf":
+        resize_image_if_needed(temp_path)
+        
     client = genai.Client(api_key=api_key)
     raw_items = []
     
     try:
-        if uploaded_file.type == "application/pdf":
-            with open(temp_path, "rb") as f:
-                raw_items.extend(analyze_chunk(f.read(), "application/pdf", client, user_vices, home_currency))
-        else:
-            slices = vision_slice_micro(temp_path)
-            bar = st.progress(0)
-            for i, s in enumerate(slices):
-                _, buf = cv2.imencode(".jpg", s)
-                raw_items.extend(analyze_chunk(buf.tobytes(), "image/jpeg", client, user_vices, home_currency))
-                bar.progress((i + 1) / len(slices))
-            time.sleep(0.2); bar.empty()
+        # NO SLICING - Send full image context for collage awareness
+        mime = "application/pdf" if uploaded_file.type == "application/pdf" else "image/jpeg"
+        with open(temp_path, "rb") as f:
+            raw_items = analyze_full_image(f.read(), mime, client, user_vices, home_currency)
     finally:
         if os.path.exists(temp_path): os.remove(temp_path)
     
     extracted = []
     for i in raw_items:
+        # 1. Total Filter
         name = str(i.get("n", "")).lower()
-        if any(x in name for x in ["total", "subtotal", "balance", "change", "cash", "due"]): continue
+        if any(x in name for x in ["total", "subtotal", "balance", "change", "cash", "due", "visa", "auth"]): continue
+        
+        # 2. Typo Fixer
+        vendor = str(i.get("v", "Unknown")).upper()
+        if "SPAN" in vendor: vendor = "SPAR"
+        if "MERCAD" in vendor: vendor = "MERCADONA"
+        if "LID" in vendor: vendor = "LIDL"
+        if "ALE" in vendor and "HOP" in vendor: vendor = "ALE-HOP"
         
         price = safe_float(i.get("p"))
         cat = str(i.get("mc", "Shopping"))
+        
+        # 3. Lemon Filter
         if price > 100 and cat in ["Groceries", "Dining", "Alcohol"]: price = price / 100.0
 
         extracted.append({
-            "Date": i.get("d"), "Vendor": i.get("v"), "Item": i.get("n"), 
+            "Date": i.get("d"), "Vendor": vendor, "Item": i.get("n"), 
             "Amount": price, "Currency": i.get("c", home_currency), 
             "Category": cat, "Sub_Category": i.get("sc", "General"), 
             "Is_Vice": i.get("vice", False), "File": uploaded_file.name
@@ -265,9 +278,13 @@ if uploaded and st.button("🔍 Audit"):
     for idx, f in enumerate(uploaded):
         data = process_upload(f, api_key, user_vices, home_curr)
         if not data.empty: 
-            # Auto-Fill
-            data['Vendor'] = data['Vendor'].replace([None, 'null'], np.nan).ffill().bfill().fillna("Unknown")
+            # Auto-Fill Logic REMOVED (No ffill to prevent bleed)
             data['Date'] = data['Date'].apply(safe_date)
+            # Find common date for THIS file only
+            if not data['Date'].isna().all():
+                mode_date = data['Date'].mode()[0]
+                data['Date'] = data['Date'].fillna(mode_date)
+                
             data['Currency'] = data['Currency'].fillna(home_curr)
             # Auto-VAT
             def get_vat(r):
