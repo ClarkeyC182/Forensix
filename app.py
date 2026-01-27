@@ -103,32 +103,33 @@ def get_api_key():
     return ""
 
 def resize_image_if_needed(image_path):
-    """Resizes very large images to fit Gemini's limits while keeping clarity"""
+    """Resizes only if MASSIVE. Increased limit to 5000px for clearer text."""
     try:
         with Image.open(image_path) as img:
-            # Resize if width > 3000 to save tokens, but keep aspect ratio
-            if img.width > 3000:
-                ratio = 3000 / img.width
+            if img.width > 5000: # Increased from 3000 to 5000
+                ratio = 5000 / img.width
                 new_height = int(img.height * ratio)
-                img = img.resize((3000, new_height), Image.Resampling.LANCZOS)
+                img = img.resize((5000, new_height), Image.Resampling.LANCZOS)
                 img.save(image_path, optimize=True, quality=85)
     except: pass
 
 def analyze_full_image(content_bytes, mime_type, client, user_vices, home_currency):
-    # COLLAGE-AWARE PROMPT
+    # DENSITY PROMPT: Explicitly asking for every single line
     prompt = f"""
-    Role: Forensic Auditor.
-    Context: The image contains MULTIPLE separate receipts arranged in a collage.
-    Task: Scan the ENTIRE image. Identify each distinct receipt. Extract items for each receipt separately.
+    Role: Senior OCR Specialist.
+    Context: A collage of receipts. 
+    Task: Extract EVERY SINGLE line item from EVERY receipt. Do not skip small items.
     
-    JSON: [{{ "d": "YYYY-MM-DD", "v": "Vendor", "n": "Item", "p": 1.00, "c": "£", "mc": "Category", "sc": "Sub", "vice": false }}]
+    JSON: [{{ "d": "YYYY-MM-DD", "v": "Vendor", "n": "Item Name", "p": 1.00, "c": "£", "mc": "Category", "sc": "Sub", "vice": false }}]
     
-    CRITICAL RULES:
-    1. **NO TOTALS:** Ignore lines saying 'Total', 'Subtotal', 'Balance', 'Change', 'Cash', 'Card'.
-    2. **VENDOR:** Identify the vendor for EACH item based on which receipt paper it is on. Do not assume one vendor for the whole image.
-    3. **DATE:** Find the date on EACH specific receipt.
-    4. **CURRENCY:** Default {home_currency}. 
-    5. **VICES:** Check: {user_vices}.
+    RULES:
+    1. **NO TOTALS:** Ignore 'Total', 'Subtotal', 'Balance', 'Change'.
+    2. **ITEM NAME:** Must be the product name. Do NOT put the price in the Item Name field.
+    3. **PRICE:** Ensure the price is in the 'p' field. 
+    4. **VENDOR:** Look at the header of the specific receipt paper the item is on.
+    5. **DATE:** Find the date on that specific receipt paper.
+    6. **CURRENCY:** Default {home_currency}. 
+    7. **VICES:** Check: {user_vices}.
     """
     try:
         res = client.models.generate_content(
@@ -150,7 +151,7 @@ def process_upload(uploaded_file, api_key, user_vices, home_currency):
     
     with open(temp_path, "wb") as f: f.write(uploaded_file.getbuffer())
     
-    # Resize to ensure we don't hit 20MB limit if strict
+    # Resize (Less aggressive now)
     if uploaded_file.type != "application/pdf":
         resize_image_if_needed(temp_path)
         
@@ -158,7 +159,6 @@ def process_upload(uploaded_file, api_key, user_vices, home_currency):
     raw_items = []
     
     try:
-        # NO SLICING - Send full image context for collage awareness
         mime = "application/pdf" if uploaded_file.type == "application/pdf" else "image/jpeg"
         with open(temp_path, "rb") as f:
             raw_items = analyze_full_image(f.read(), mime, client, user_vices, home_currency)
@@ -168,24 +168,34 @@ def process_upload(uploaded_file, api_key, user_vices, home_currency):
     extracted = []
     for i in raw_items:
         # 1. Total Filter
-        name = str(i.get("n", "")).lower()
-        if any(x in name for x in ["total", "subtotal", "balance", "change", "cash", "due", "visa", "auth"]): continue
+        name = str(i.get("n", "")).strip()
+        name_lower = name.lower()
+        if any(x in name_lower for x in ["total", "subtotal", "balance", "change", "cash", "due", "visa", "auth"]): continue
         
-        # 2. Typo Fixer
+        price = safe_float(i.get("p"))
+        
+        # 2. PRICE SWAP LOGIC (Fixes "GAME 21.28" error)
+        # If Item Name looks like a number (e.g. "21.28") and Price is 0... Swap them!
+        if price == 0.0 and re.match(r'^\d+\.?\d*$', name):
+            try:
+                price = float(name)
+                name = "Unidentified Item" # Swap name to generic
+            except: pass
+
+        # 3. Typo Fixer
         vendor = str(i.get("v", "Unknown")).upper()
         if "SPAN" in vendor: vendor = "SPAR"
         if "MERCAD" in vendor: vendor = "MERCADONA"
         if "LID" in vendor: vendor = "LIDL"
         if "ALE" in vendor and "HOP" in vendor: vendor = "ALE-HOP"
         
-        price = safe_float(i.get("p"))
         cat = str(i.get("mc", "Shopping"))
         
-        # 3. Lemon Filter
+        # 4. Lemon Filter
         if price > 100 and cat in ["Groceries", "Dining", "Alcohol"]: price = price / 100.0
 
         extracted.append({
-            "Date": i.get("d"), "Vendor": vendor, "Item": i.get("n"), 
+            "Date": i.get("d"), "Vendor": vendor, "Item": name, 
             "Amount": price, "Currency": i.get("c", home_currency), 
             "Category": cat, "Sub_Category": i.get("sc", "General"), 
             "Is_Vice": i.get("vice", False), "File": uploaded_file.name
@@ -278,13 +288,12 @@ if uploaded and st.button("🔍 Audit"):
     for idx, f in enumerate(uploaded):
         data = process_upload(f, api_key, user_vices, home_curr)
         if not data.empty: 
-            # Auto-Fill Logic REMOVED (No ffill to prevent bleed)
             data['Date'] = data['Date'].apply(safe_date)
-            # Find common date for THIS file only
+            # Safe Mode for Date
             if not data['Date'].isna().all():
                 mode_date = data['Date'].mode()[0]
                 data['Date'] = data['Date'].fillna(mode_date)
-                
+            
             data['Currency'] = data['Currency'].fillna(home_curr)
             # Auto-VAT
             def get_vat(r):
@@ -330,4 +339,5 @@ with t1:
         st.altair_chart(alt.Chart(df).mark_bar().encode(x='Category', y='Amount', color='Category'), use_container_width=True)
 with t2:
     if not df.empty: st.dataframe(df, use_container_width=True)
-        
+
+    
