@@ -23,26 +23,35 @@ for d in DIRS.values(): d.mkdir(exist_ok=True)
 # CONSTANTS
 REQUIRED_COLS = ["Date", "Vendor", "Item", "Amount", "Currency", "IVA", "Category", "Sub_Category", "Is_Vice", "File"]
 
-# --- DATABASE REPAIR KIT ---
+# --- DATABASE REPAIR KIT (LOOP BREAKER) ---
 def repair_sheet():
     conn = st.connection("gsheets", type=GSheetsConnection)
-    empty_structure = pd.DataFrame(columns=REQUIRED_COLS)
-    conn.update(worksheet="Sheet1", data=empty_structure)
+    # FORCE WRITE 1 DUMMY ROW to break the empty-sheet loop
+    dummy_data = pd.DataFrame([{
+        "Date": "2026-01-01", "Vendor": "System", "Item": "Initialization", 
+        "Amount": 0.0, "Currency": "£", "IVA": 0.0, "Category": "System", 
+        "Sub_Category": "Init", "Is_Vice": False, "File": "system.txt"
+    }])
+    conn.update(worksheet="Sheet1", data=dummy_data)
     st.cache_data.clear()
 
 def load_data():
     conn = st.connection("gsheets", type=GSheetsConnection)
     try:
         df = conn.read(worksheet="Sheet1", ttl=0)
-        # If completely empty or missing columns, return broken state to trigger repair
-        if df.empty or len(df.columns) < 2: return pd.DataFrame(columns=REQUIRED_COLS)
-        return df
+        # Filter out the dummy row so user doesn't see it
+        if not df.empty and "Item" in df.columns:
+            df = df[df["Item"] != "Initialization"]
+        
+        # Self-Heal Columns
+        for col in REQUIRED_COLS:
+            if col not in df.columns: df[col] = None
+        return df[REQUIRED_COLS]
     except: return pd.DataFrame(columns=REQUIRED_COLS)
 
 def save_data(df):
     conn = st.connection("gsheets", type=GSheetsConnection)
     df_save = df.copy()
-    # Force Types
     df_save['Date'] = pd.to_datetime(df_save['Date'], errors='coerce').fillna(pd.Timestamp.now()).dt.strftime('%Y-%m-%d')
     df_save['Amount'] = pd.to_numeric(df_save['Amount'], errors='coerce').fillna(0.0)
     df_save['IVA'] = pd.to_numeric(df_save['IVA'], errors='coerce').fillna(0.0)
@@ -194,7 +203,7 @@ if missing_cols or df_raw.empty:
         st.success("Repaired! Reloading...")
         time.sleep(1)
         st.rerun()
-    st.stop() # <--- SAFETY BRAKE: This prevents the crash.
+    st.stop() # <--- SAFETY BRAKE
 
 # 3. CLEAN DATAFRAME FOR UI
 df = df_raw.copy()
@@ -263,7 +272,7 @@ if uploaded and st.button("🔍 Audit"):
     
     if rows:
         combined = pd.concat(rows, ignore_index=True)
-        # Auto-Fill
+        # Auto-Fill Logic
         combined['Vendor'] = combined['Vendor'].fillna("Unknown").ffill().bfill()
         combined['Date'] = pd.to_datetime(combined['Date']).ffill().bfill().fillna(pd.Timestamp.now())
         combined['Amount'] = pd.to_numeric(combined['Amount'], errors='coerce').fillna(0.0)
