@@ -34,10 +34,9 @@ def load_data():
     conn = st.connection("gsheets", type=GSheetsConnection)
     try:
         df = conn.read(worksheet="Sheet1", ttl=0)
+        # If completely empty or missing columns, return broken state to trigger repair
         if df.empty or len(df.columns) < 2: return pd.DataFrame(columns=REQUIRED_COLS)
-        for col in REQUIRED_COLS:
-            if col not in df.columns: df[col] = None
-        return df[REQUIRED_COLS]
+        return df
     except: return pd.DataFrame(columns=REQUIRED_COLS)
 
 def save_data(df):
@@ -187,6 +186,7 @@ df_raw = load_data()
 missing_cols = [c for c in REQUIRED_COLS if c not in df_raw.columns]
 
 # 2. SCHEMA VALIDATION UI
+# CRITICAL FIX: The app will STOP here if the DB is broken.
 if missing_cols or df_raw.empty:
     st.warning("⚠️ Database Schema Mismatch (Empty or Wrong Columns)")
     if st.button("🛠️ Repair Database Schema"):
@@ -194,13 +194,15 @@ if missing_cols or df_raw.empty:
         st.success("Repaired! Reloading...")
         time.sleep(1)
         st.rerun()
-    if not df_raw.empty: st.caption("Attempting to run with partial data...")
+    st.stop() # <--- SAFETY BRAKE: This prevents the crash.
 
 # 3. CLEAN DATAFRAME FOR UI
 df = df_raw.copy()
+# Ensure critical columns exist before processing
 for c in REQUIRED_COLS: 
     if c not in df.columns: df[c] = None
 
+# Sanitize
 df['Amount'] = pd.to_numeric(df['Amount'], errors='coerce').fillna(0.0)
 df['IVA'] = pd.to_numeric(df['IVA'], errors='coerce').fillna(0.0)
 df['Is_Vice'] = df['Is_Vice'].fillna(False).astype(bool)
@@ -250,12 +252,18 @@ uploaded = st.file_uploader("Upload", accept_multiple_files=True)
 if uploaded and st.button("🔍 Audit"):
     rows = []
     for f in uploaded:
-        data = process_upload(f, api_key, user_vices, home_curr)
+        if f.type == "application/pdf":
+            data = process_upload(f, api_key, user_vices, home_curr)
+        else:
+            # Handle Images via Slicing Logic
+            # Note: process_upload handles file saving internally so we call it directly
+            data = process_upload(f, api_key, user_vices, home_curr)
+            
         if not data.empty: rows.append(data)
     
     if rows:
         combined = pd.concat(rows, ignore_index=True)
-        # Auto-Fill Logic
+        # Auto-Fill
         combined['Vendor'] = combined['Vendor'].fillna("Unknown").ffill().bfill()
         combined['Date'] = pd.to_datetime(combined['Date']).ffill().bfill().fillna(pd.Timestamp.now())
         combined['Amount'] = pd.to_numeric(combined['Amount'], errors='coerce').fillna(0.0)
@@ -287,5 +295,4 @@ with t1:
         st.altair_chart(alt.Chart(df).mark_bar().encode(x='Category', y='Amount', color='Category'), use_container_width=True)
 with t2:
     if not df.empty: st.dataframe(df, use_container_width=True)
-
-    
+        
