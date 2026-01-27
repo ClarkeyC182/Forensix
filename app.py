@@ -33,7 +33,6 @@ def load_data():
     try:
         df = conn.read(worksheet="Sheet1", usecols=list(range(10)), ttl=5)
         df = df.dropna(how="all")
-        # Robust Date Loading
         df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
         return df
     except: return pd.DataFrame(columns=["Date", "Vendor", "Item", "Amount", "Currency", "IVA", "Category", "Sub_Category", "Is_Vice", "File"])
@@ -41,78 +40,52 @@ def load_data():
 def save_data(df):
     conn = st.connection("gsheets", type=GSheetsConnection)
     df_save = df.copy()
-    # --- CRASH FIX: Force Date Conversion ---
+    
+    # --- CRASH FIX V24: AGGRESSIVE TYPE ENFORCEMENT ---
+    # 1. Force Date to datetime objects, turn errors (like "None") into NaT
     df_save['Date'] = pd.to_datetime(df_save['Date'], errors='coerce')
-    # Handle any rows where date failed (Nat) by setting to today
+    
+    # 2. Fill missing dates with Today
     df_save['Date'] = df_save['Date'].fillna(pd.Timestamp.now())
-    # Format safely
+    
+    # 3. Now it is safe to use .dt accessor
     df_save['Date'] = df_save['Date'].dt.strftime('%Y-%m-%d')
+    
+    # 4. Ensure Amounts are numbers (fix "None" issues)
+    df_save['Amount'] = pd.to_numeric(df_save['Amount'], errors='coerce').fillna(0.0)
+    
     conn.update(worksheet="Sheet1", data=df_save)
 
-# --- TAX LOGIC ENGINE ---
+# --- TAX LOGIC ---
 def calculate_net_monthly_advanced(gross_annual, residency, tax_code=None):
     net_annual = 0
-    
     if "UK" in residency:
-        # UK LOGIC
-        # 1. Parse Tax Code (e.g., 1257L -> 12570 allowance)
-        allowance = 12570 # Default
+        allowance = 12570
         if tax_code and str(tax_code).upper().endswith('L'):
             try:
                 digits = int(re.sub(r'\D', '', str(tax_code)))
                 allowance = digits * 10
             except: pass
-            
         taxable_income = max(0, gross_annual - allowance)
-        
-        # 2. Income Tax (Simplified Bands 2025)
         income_tax = 0
-        if taxable_income <= 37700:
-            income_tax = taxable_income * 0.20
-        else:
-            # Basic rate on first 37.7k
-            income_tax = 37700 * 0.20
-            # Higher rate (40%) on rest
-            income_tax += (taxable_income - 37700) * 0.40
-            
-        # 3. National Insurance (Approx 8% over ~12.5k)
+        if taxable_income <= 37700: income_tax = taxable_income * 0.20
+        else: income_tax = (37700 * 0.20) + ((taxable_income - 37700) * 0.40)
         ni = 0
-        if gross_annual > 12570:
-            ni = (gross_annual - 12570) * 0.08
-            
+        if gross_annual > 12570: ni = (gross_annual - 12570) * 0.08
         net_annual = gross_annual - income_tax - ni
-        
     elif "Spain" in residency:
-        # SPAIN IRPF ESTIMATOR (General Scale 2025)
-        # Note: This is an approximation. Spain tax varies by region (Andalusia etc.)
-        # We apply a standard IRPF curve + Social Security deduction (~6.35%)
-        
         social_security = gross_annual * 0.0635
-        base_imponible = gross_annual - social_security - 2000 # Standard deduction
-        
+        base_imponible = gross_annual - social_security - 2000
         irpf = 0
-        # Progressive Bands
-        bands = [
-            (12450, 0.19),
-            (20200, 0.24),
-            (35200, 0.30),
-            (60000, 0.37),
-            (300000, 0.45)
-        ]
-        
-        remaining = base_imponible
+        bands = [(12450, 0.19), (20200, 0.24), (35200, 0.30), (60000, 0.37), (300000, 0.45)]
         previous_limit = 0
-        
         for limit, rate in bands:
             if base_imponible > previous_limit:
                 taxable_in_band = min(base_imponible, limit) - previous_limit
                 irpf += taxable_in_band * rate
                 previous_limit = limit
-            else:
-                break
-                
+            else: break
         net_annual = gross_annual - social_security - irpf
-
     return net_annual / 12
 
 # --- ENGINE ---
@@ -139,13 +112,13 @@ def analyze_content(content_bytes, mime_type, client, user_vices, home_currency)
     prompt = f"""
     Role: Forensic Auditor. Extract items, DATE, and CURRENCY.
     Context: Image may contain multiple receipts.
-    Output keys: d=date(YYYY-MM-DD), v=vendor, n=name, p=price, c=currency_symbol, mc=cat, sc=sub, vice=bool.
+    Output keys: d=date(YYYY-MM-DD), v=vendor, n=name, p=price(number), c=currency_symbol, mc=cat, sc=sub, vice=bool.
     Rules:
     1. Look for date. If null, use null.
     2. Look for currency (£, €, $). If missing, assume {home_currency}.
     3. Main Cat: [Groceries, Dining, Alcohol, Transport, Shopping, Utils, Services].
     4. Vice: {user_vices}
-    5. Vendor: Look closely for the logo/header on THIS specific receipt.
+    5. Price: Must be a number. If missing, use 0.0.
     
     IMPORTANT: RETURN ONLY RAW JSON ARRAY. Example: [{{ ... }}]
     """
@@ -175,7 +148,7 @@ def analyze_content(content_bytes, mime_type, client, user_vices, home_currency)
                 "Date": i.get("d"),
                 "Vendor": i.get("v", "Unknown"),
                 "Item": i.get("n", "Item"),
-                "Amount": i.get("p", 0.0),
+                "Amount": i.get("p", 0.0), # Default to 0.0 if missing
                 "Currency": i.get("c", home_currency),
                 "Category": i.get("mc", "Shopping"),
                 "Sub_Category": i.get("sc", "General"),
@@ -206,20 +179,17 @@ def process_upload(uploaded_file, api_key, user_vices, home_currency):
     
     if extracted_items:
         df_temp = pd.DataFrame(extracted_items)
-        
-        # --- FIX: REMOVED AGGRESSIVE VENDOR AUTO-FILL ---
-        # We only standardise formats, we DO NOT copy "Ale-Hop" down to everything else.
         if 'Vendor' in df_temp.columns:
             df_temp['Vendor'] = df_temp['Vendor'].replace(["null", None], "Unknown")
-            
         if 'Date' in df_temp.columns:
             df_temp['Date'] = pd.to_datetime(df_temp['Date'], errors='coerce')
             df_temp['Date'] = df_temp['Date'].ffill().bfill().fillna(pd.Timestamp.now())
-            
         if 'Currency' in df_temp.columns:
              df_temp['Currency'] = df_temp['Currency'].replace([None, ""], np.nan)
              df_temp['Currency'] = df_temp['Currency'].ffill().bfill().fillna(home_currency)
-             
+        if 'Amount' in df_temp.columns:
+            df_temp['Amount'] = pd.to_numeric(df_temp['Amount'], errors='coerce').fillna(0.0)
+
         for col in ["IVA", "File"]: 
             if col not in df_temp.columns: df_temp[col] = ""
             
@@ -263,9 +233,13 @@ with st.sidebar:
     residency = st.selectbox("Tax Residency", ["UK (GBP)", "Spain (EUR)"], index=1)
     home_currency = "£" if "UK" in residency else "€"
     
-    # TAX CODE LOGIC
+    use_manual_tax = st.checkbox("I know my Tax Rate", value=False)
+    if use_manual_tax:
+        manual_tax_rate = st.slider("Effective Tax Rate (%)", 0, 60, 20)
+    
+    # TAX CODE LOGIC (Only shows if Manual unchecked and UK selected)
     tax_code_input = ""
-    if "UK" in residency:
+    if "UK" in residency and not use_manual_tax:
         tax_code_input = st.text_input("Tax Code (Optional)", placeholder="e.g. 1257L")
     
     st.markdown("### 💰 Income")
@@ -278,9 +252,13 @@ with st.sidebar:
     elif income_freq == "Monthly": gross_annual = gross_income * 12
     elif income_freq == "Hourly": gross_annual = gross_income * 160 * 12
     
-    # ADVANCED NET CALC
-    net_monthly = calculate_net_monthly_advanced(gross_annual, residency, tax_code_input)
-    st.metric("Est. Net Monthly", f"{home_currency}{net_monthly:,.2f}", help="Calculated using local tax bands")
+    if use_manual_tax:
+        net_annual = gross_annual * (1 - (manual_tax_rate/100))
+    else:
+        net_annual = calculate_net_monthly_advanced(gross_annual, residency, tax_code_input) * 12
+        
+    net_monthly = net_annual / 12
+    st.metric("Est. Net Monthly", f"{home_currency}{net_monthly:,.2f}")
 
     st.markdown("---")
     st.markdown("### 📅 Time Travel")
@@ -383,6 +361,7 @@ if st.session_state.review_data is not None:
         num_rows="dynamic", 
         use_container_width=True,
         column_config={
+            "Date": st.column_config.DateColumn("Date", format="YYYY-MM-DD"), # Force Date Picker
             "Currency": st.column_config.SelectboxColumn("Currency", options=["£", "€", "$"]),
             "Category": st.column_config.SelectboxColumn("Category", options=["Groceries", "Dining", "Alcohol", "Transport", "Shopping", "Utils", "Services"]),
             "Is_Vice": st.column_config.CheckboxColumn("Vice?", default=False)
@@ -430,3 +409,5 @@ with tab3:
             st.warning(f"**Vice Alert:** {vice_percent:.1f}% of your income went to 'Habits' this month.")
         else:
             st.success(f"**Good Job:** Your vice spending is under control ({vice_percent:.1f}%).")
+    else:
+        st.info("Upload data to generate insights.")
