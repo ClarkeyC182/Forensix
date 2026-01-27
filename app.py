@@ -23,46 +23,49 @@ for d in DIRS.values(): d.mkdir(exist_ok=True)
 # CONSTANTS
 REQUIRED_COLS = ["Date", "Vendor", "Item", "Amount", "Currency", "IVA", "Category", "Sub_Category", "Is_Vice", "File"]
 
-# --- DATABASE CONNECTION (THE FIX) ---
+# --- DATABASE ENGINE (THE PARANOID FIX) ---
 def load_data():
     conn = st.connection("gsheets", type=GSheetsConnection)
     try:
+        # 1. Force a raw read with NO cache
         df = conn.read(worksheet="Sheet1", ttl=0)
         
-        # --- FORCE FIELD: Ensure Columns Exist ---
-        # Even if GSheets sends garbage, we force these columns into existence
+        # 2. If the sheet is empty or just has headers, start fresh
+        if df.empty:
+            return pd.DataFrame(columns=REQUIRED_COLS)
+            
+        # 3. CRITICAL: Ensure every required column exists. 
+        # If 'Amount' is missing in the sheet, create it here with 0.0
         for col in REQUIRED_COLS:
             if col not in df.columns:
                 df[col] = None
         
-        # Force Clean Data Types immediately
+        # 4. Force Data Types (The Anti-Crash Layer)
         df['Amount'] = pd.to_numeric(df['Amount'], errors='coerce').fillna(0.0)
         df['IVA'] = pd.to_numeric(df['IVA'], errors='coerce').fillna(0.0)
         df['Is_Vice'] = df['Is_Vice'].fillna(False).astype(bool)
         df['Date'] = pd.to_datetime(df['Date'], errors='coerce').fillna(pd.Timestamp.now())
         
-        return df[REQUIRED_COLS] # Return strictly ordered columns
-    except:
-        # If total failure, return empty but correct structure
+        # 5. Clean text columns
+        for col in ['Vendor', 'Item', 'Currency', 'Category', 'Sub_Category', 'File']:
+            df[col] = df[col].astype(str).replace('nan', '').replace('None', '')
+            
+        return df[REQUIRED_COLS] # Return strictly these columns
+        
+    except Exception as e:
+        # If connection fails completely, return a safe empty empty dataframe
+        # This prevents the "KeyError" because the app will see an empty table with correct columns
         return pd.DataFrame(columns=REQUIRED_COLS)
 
 def save_data(df):
     conn = st.connection("gsheets", type=GSheetsConnection)
     df_save = df.copy()
-    # Force Types before save
-    df_save['Date'] = pd.to_datetime(df_save['Date'], errors='coerce').fillna(pd.Timestamp.now()).dt.strftime('%Y-%m-%d')
-    df_save['Amount'] = pd.to_numeric(df_save['Amount'], errors='coerce').fillna(0.0)
-    df_save['IVA'] = pd.to_numeric(df_save['IVA'], errors='coerce').fillna(0.0)
-    df_save['Is_Vice'] = df_save['Is_Vice'].fillna(False).astype(bool)
-    
-    # Clean Strings
-    for col in ['Vendor', 'Item', 'Currency', 'Category', 'Sub_Category', 'File']:
-        if col in df_save.columns:
-            df_save[col] = df_save[col].astype(str).replace('nan', '').replace('None', '')
-            
+    # Formatting for Google Sheets
+    df_save['Date'] = pd.to_datetime(df_save['Date']).dt.strftime('%Y-%m-%d')
+    df_save['Amount'] = pd.to_numeric(df_save['Amount']).fillna(0.0)
     conn.update(worksheet="Sheet1", data=df_save)
 
-# --- PDF ENGINE ---
+# --- PDF & SLICING ENGINES ---
 def generate_pdf_safe(df, goal_name, currency_symbol):
     try:
         pdf = FPDF()
@@ -77,87 +80,39 @@ def generate_pdf_safe(df, goal_name, currency_symbol):
         
         pdf.set_font("Arial", '', 8)
         for _, row in df.iterrows():
-            safe_date = str(row['Date'])[:10]
-            safe_vend = str(row['Vendor'])[:18]
-            safe_item = str(row['Item'])[:35]
-            safe_price = f"{row['Amount']:.2f}"
-            
-            pdf.cell(30, 6, safe_date, 1)
-            pdf.cell(40, 6, safe_vend, 1)
-            pdf.cell(80, 6, safe_item, 1)
-            pdf.cell(30, 6, safe_price, 1)
-            pdf.ln()
+            d = str(row['Date'])[:10]
+            v = str(row['Vendor'])[:15]
+            i = str(row['Item'])[:35]
+            p = f"{row['Amount']:.2f}"
+            pdf.cell(30, 6, d, 1); pdf.cell(40, 6, v, 1); pdf.cell(80, 6, i, 1); pdf.cell(30, 6, p, 1); pdf.ln()
         return pdf.output(dest='S').encode('latin-1')
     except: return None
-
-# --- TAX LOGIC ---
-def calculate_accurate_tax(gross_annual, residency, tax_code):
-    net_annual = 0.0
-    if "UK" in residency:
-        allowance = 12570
-        if tax_code and str(tax_code).upper().endswith('L'):
-            try: digits = int(re.sub(r'\D', '', str(tax_code))); allowance = digits * 10
-            except: pass
-        if gross_annual > 100000: allowance = max(0, allowance - (gross_annual - 100000) / 2)
-        
-        taxable = max(0, gross_annual - allowance)
-        tax = 0.0
-        
-        if taxable > 0: tax += min(taxable, 37700) * 0.20
-        if taxable > 37700: tax += min(taxable - 37700, 125140 - 37700) * 0.40
-        if taxable > 125140: tax += (taxable - 125140) * 0.45
-        
-        ni = 0.0
-        if gross_annual > 12570: ni += min(max(0, gross_annual - 12570), 50270 - 12570) * 0.08
-        if gross_annual > 50270: ni += (gross_annual - 50270) * 0.02
-        
-        net_annual = gross_annual - tax - ni
-        
-    elif "Spain" in residency:
-        ss_tax = min(gross_annual, 56646) * 0.0635
-        base = gross_annual - ss_tax - 2000
-        irpf = 0.0
-        bands = [(12450, 0.19), (20200, 0.24), (35200, 0.30), (60000, 0.37), (300000, 0.45)]
-        prev = 0
-        for limit, rate in bands:
-            if base > prev:
-                irpf += (min(base, limit) - prev) * rate
-                prev = limit
-            else: break
-        net_annual = gross_annual - ss_tax - irpf
-        
-    else:
-        net_annual = gross_annual * 0.78 # Default Fallback
-
-    return net_annual / 12
-
-# --- AI ENGINE ---
-def get_api_key():
-    if "GEMINI_API_KEY" in st.secrets: return st.secrets["GEMINI_API_KEY"]
-    return ""
 
 def vision_slice_micro(image_path):
     img = cv2.imread(str(image_path))
     if img is None: return []
     h, w = img.shape[:2]
     if h < 1000: return [img]
+    
     slices, start = [], 0
     while start < h:
         end = min(start + 1000, h)
         if (end - start) < 100 and len(slices) > 0: break 
         slices.append(img[start:end, :])
         if end == h: break
-        start += 800 
+        start += 800
     return slices
+
+# --- AI ENGINE ---
+def get_api_key():
+    if "GEMINI_API_KEY" in st.secrets: return st.secrets["GEMINI_API_KEY"]
+    return ""
 
 def analyze_chunk(content_bytes, mime_type, client, user_vices, home_currency):
     prompt = f"""
     Role: Forensic Auditor. Extract items.
     JSON Format: [{{ "d": "YYYY-MM-DD", "v": "Vendor", "n": "Item", "p": 1.00, "c": "£", "mc": "Category", "sc": "Sub", "vice": false }}]
-    Rules: 
-    1. Currency default {home_currency}. 
-    2. Vice keywords: {user_vices}.
-    3. Return ONLY valid JSON array.
+    Rules: Currency default {home_currency}. Vice keywords: {user_vices}.
     """
     try:
         res = client.models.generate_content(
@@ -196,24 +151,48 @@ def process_upload(uploaded_file, api_key, user_vices, home_currency):
     extracted = []
     for i in raw_items:
         extracted.append({
-            "Date": i.get("d"), 
-            "Vendor": i.get("v"), 
-            "Item": i.get("n"), 
-            "Amount": i.get("p", 0.0),
-            "Currency": i.get("c", home_currency), 
-            "Category": i.get("mc", "Shopping"),
-            "Sub_Category": i.get("sc", "General"), 
-            "Is_Vice": i.get("vice", False), 
-            "File": uploaded_file.name
+            "Date": i.get("d"), "Vendor": i.get("v"), "Item": i.get("n"), "Amount": i.get("p", 0.0),
+            "Currency": i.get("c", home_currency), "Category": i.get("mc", "Shopping"),
+            "Sub_Category": i.get("sc", "General"), "Is_Vice": i.get("vice", False), "File": uploaded_file.name
         })
     return pd.DataFrame(extracted)
+
+# --- TAX LOGIC ---
+def calculate_accurate_tax(gross_annual, residency, tax_code):
+    net_annual = 0.0
+    if "UK" in residency:
+        allowance = 12570
+        if tax_code and str(tax_code).upper().endswith('L'):
+            try: digits = int(re.sub(r'\D', '', str(tax_code))); allowance = digits * 10
+            except: pass
+        if gross_annual > 100000: allowance = max(0, allowance - (gross_annual - 100000) / 2)
+        taxable = max(0, gross_annual - allowance)
+        tax = 0.0
+        if taxable > 0: tax += min(taxable, 37700) * 0.20
+        if taxable > 37700: tax += min(taxable - 37700, 125140 - 37700) * 0.40
+        if taxable > 125140: tax += (taxable - 125140) * 0.45
+        ni = 0.0
+        if gross_annual > 12570: ni += min(max(0, gross_annual - 12570), 50270 - 12570) * 0.08
+        if gross_annual > 50270: ni += (gross_annual - 50270) * 0.02
+        net_annual = gross_annual - tax - ni
+    elif "Spain" in residency:
+        ss_tax = min(gross_annual, 56646) * 0.0635
+        base = gross_annual - ss_tax - 2000
+        irpf, prev = 0.0, 0
+        bands = [(12450, 0.19), (20200, 0.24), (35200, 0.30), (60000, 0.37), (300000, 0.45)]
+        for limit, rate in bands:
+            if base > prev: irpf += (min(base, limit) - prev) * rate; prev = limit
+            else: break
+        net_annual = gross_annual - ss_tax - irpf
+    else: net_annual = gross_annual * 0.78
+    return net_annual / 12
 
 # --- UI START ---
 api_key = get_api_key()
 if not api_key: st.stop()
 
-# 1. LOAD DATA
-df = load_data() # Now guaranteed to have columns
+# 1. LOAD DATA (PARANOID MODE)
+df = load_data()
 
 # 2. SIDEBAR
 with st.sidebar:
@@ -256,9 +235,11 @@ col4.progress(min(vice/goal_target, 1.0) if goal_target > 0 else 0)
 uploaded = st.file_uploader("Upload", accept_multiple_files=True)
 if uploaded and st.button("🔍 Audit"):
     rows = []
-    for f in uploaded:
+    progress_bar = st.progress(0)
+    for idx, f in enumerate(uploaded):
         data = process_upload(f, api_key, user_vices, home_curr)
         if not data.empty: rows.append(data)
+        progress_bar.progress((idx + 1) / len(uploaded))
     
     if rows:
         combined = pd.concat(rows, ignore_index=True)
@@ -288,4 +269,4 @@ with t1:
 with t2:
     if not df.empty: st.dataframe(df, use_container_width=True)
 
-
+    
