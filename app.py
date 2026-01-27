@@ -5,6 +5,8 @@ import cv2
 import json
 import os
 import uuid
+import re  # <--- Added back (Fixes Tax Calc)
+import altair as alt # <--- Added back (Fixes Charts)
 from pathlib import Path
 from google import genai
 from google.genai import types
@@ -22,16 +24,14 @@ for d in DIRS.values(): d.mkdir(exist_ok=True)
 # CONSTANTS
 REQUIRED_COLS = ["Date", "Vendor", "Item", "Amount", "Currency", "IVA", "Category", "Sub_Category", "Is_Vice", "File"]
 
-# --- HELPER: SAFE TYPE CONVERTERS (CRITICAL) ---
+# --- HELPER: SAFE TYPE CONVERTERS ---
 def safe_float(val):
-    """Converts anything to a float. Returns 0.0 if it fails."""
     try:
         if val is None: return 0.0
         return float(val)
     except: return 0.0
 
 def safe_date(val):
-    """Converts anything to a datetime. Returns Today if it fails."""
     try:
         s = str(val).strip().lower()
         if s in ['none', 'null', 'nan', '', 'yyyy-mm-dd', 'unknown']: return pd.Timestamp.now()
@@ -39,46 +39,34 @@ def safe_date(val):
         return pd.Timestamp.now() if pd.isna(dt) else dt
     except: return pd.Timestamp.now()
 
-# --- DATABASE ENGINE (MASTER TEMPLATE) ---
+# --- DATABASE ENGINE ---
 def load_data():
-    # 1. Create a Perfect Empty Template in Memory
     df_template = pd.DataFrame(columns=REQUIRED_COLS)
-    
     conn = st.connection("gsheets", type=GSheetsConnection)
     try:
-        # 2. Try to load sheet
         df_sheet = conn.read(worksheet="Sheet1", ttl=0)
-        
-        # 3. Merge Sheet into Template
-        # This ensures that even if the sheet is empty/broken, we get the right columns
         if not df_sheet.empty:
             df_final = pd.concat([df_template, df_sheet], ignore_index=True)
         else:
             df_final = df_template
 
-        # 4. Strict Column Enforcement
-        # Discard extra columns, add missing ones
         df_final = df_final.reindex(columns=REQUIRED_COLS)
         
-        # 5. Sanitize Data Types immediately
+        # Sanitize
         df_final['Amount'] = df_final['Amount'].apply(safe_float)
         df_final['IVA'] = df_final['IVA'].apply(safe_float)
         df_final['Is_Vice'] = df_final['Is_Vice'].fillna(False).astype(bool)
         df_final['Date'] = df_final['Date'].apply(safe_date)
         
-        # 6. Sanitize Strings
         for c in ['Vendor', 'Item', 'Currency', 'Category', 'Sub_Category', 'File']:
             df_final[c] = df_final[c].astype(str).replace('nan', '').replace('None', '')
 
         return df_final
-    except Exception:
-        # If GSheets fails entirely, return the empty template so the app runs
-        return df_template
+    except: return df_template
 
 def save_data(df):
     conn = st.connection("gsheets", type=GSheetsConnection)
     df_save = df.copy()
-    # Final cleanup before save
     df_save['Date'] = df_save['Date'].apply(safe_date).dt.strftime('%Y-%m-%d')
     df_save['Amount'] = df_save['Amount'].apply(safe_float)
     df_save['IVA'] = df_save['IVA'].apply(safe_float)
@@ -152,7 +140,6 @@ def analyze_chunk(content_bytes, mime_type, client, user_vices, home_currency):
     except: return []
 
 def process_upload(uploaded_file, api_key, user_vices, home_currency):
-    # Use unique filename to prevent FileNotFoundError collisions
     unique_name = f"{uuid.uuid4()}_{uploaded_file.name}"
     temp_path = DIRS['TEMP'] / unique_name
     
@@ -173,19 +160,14 @@ def process_upload(uploaded_file, api_key, user_vices, home_currency):
                 bar.progress((i + 1) / len(slices))
             time.sleep(0.2); bar.empty()
     finally:
-        # Always clean up temp file
         if os.path.exists(temp_path): os.remove(temp_path)
     
     extracted = []
     for i in raw_items:
-        # Filter Totals
         name = str(i.get("n", "")).lower()
         if any(x in name for x in ["total", "subtotal", "balance", "change", "cash", "due"]): continue
         
-        # Safe Price
         price = safe_float(i.get("p"))
-        
-        # Lemon Filter
         cat = str(i.get("mc", "Shopping"))
         if price > 100 and cat in ["Groceries", "Dining", "Alcohol"]: price = price / 100.0
 
@@ -231,7 +213,7 @@ def calculate_net(gross, residency, tax_code):
 api_key = get_api_key()
 if not api_key: st.stop()
 
-# 1. LOAD DATA (MASTER TEMPLATE)
+# 1. LOAD DATA
 df = load_data()
 
 # 2. SIDEBAR
@@ -305,7 +287,6 @@ if uploaded and st.button("🔍 Audit"):
 if 'review_data' in st.session_state and st.session_state.review_data is not None:
     st.divider()
     st.info("Review Data")
-    # Date fix for Editor
     if not st.session_state.review_data.empty:
         st.session_state.review_data['Date'] = pd.to_datetime(st.session_state.review_data['Date']).dt.date
         
