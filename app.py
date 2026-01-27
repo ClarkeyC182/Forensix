@@ -20,52 +20,41 @@ BASE_DIR = Path(__file__).parent.absolute()
 DIRS = { "TEMP": BASE_DIR / "temp_uploads" }
 for d in DIRS.values(): d.mkdir(exist_ok=True)
 
-# CONSTANTS
-REQUIRED_COLS = ["Date", "Vendor", "Item", "Amount", "Currency", "IVA", "Category", "Sub_Category", "Is_Vice", "File"]
-
-# --- DATABASE REPAIR KIT (LOOP BREAKER) ---
-def repair_sheet():
-    conn = st.connection("gsheets", type=GSheetsConnection)
-    # FORCE WRITE 1 DUMMY ROW to break the empty-sheet loop
-    dummy_data = pd.DataFrame([{
-        "Date": "2026-01-01", "Vendor": "System", "Item": "Initialization", 
-        "Amount": 0.0, "Currency": "£", "IVA": 0.0, "Category": "System", 
-        "Sub_Category": "Init", "Is_Vice": False, "File": "system.txt"
-    }])
-    conn.update(worksheet="Sheet1", data=dummy_data)
-    st.cache_data.clear()
-
+# --- DATABASE CONNECTION ---
 def load_data():
     conn = st.connection("gsheets", type=GSheetsConnection)
     try:
+        # ttl=0 ensures we always get fresh data, no caching
         df = conn.read(worksheet="Sheet1", ttl=0)
-        
-        # Self-Healing: If sheet is totally empty/broken, return empty DF to trigger repair UI
-        if df.empty or len(df.columns) < 2: 
-            return pd.DataFrame(columns=REQUIRED_COLS)
-            
-        # Filter out the dummy row so user doesn't see it
-        if "Item" in df.columns:
-            df = df[df["Item"] != "Initialization"]
-        
-        # Ensure all columns exist
-        for col in REQUIRED_COLS:
-            if col not in df.columns: df[col] = None
-            
-        return df[REQUIRED_COLS]
-    except: return pd.DataFrame(columns=REQUIRED_COLS)
+        return df
+    except:
+        # If connection fails, return empty structure to prevent crash
+        return pd.DataFrame(columns=["Date", "Vendor", "Item", "Amount", "Currency", "IVA", "Category", "Sub_Category", "Is_Vice", "File"])
 
 def save_data(df):
     conn = st.connection("gsheets", type=GSheetsConnection)
     df_save = df.copy()
-    df_save['Date'] = pd.to_datetime(df_save['Date'], errors='coerce').fillna(pd.Timestamp.now()).dt.strftime('%Y-%m-%d')
+    
+    # STRICT TYPE ENFORCEMENT BEFORE SAVE
+    # 1. Date: Force to YYYY-MM-DD string
+    df_save['Date'] = pd.to_datetime(df_save['Date'], errors='coerce').fillna(pd.Timestamp.now())
+    df_save['Date'] = df_save['Date'].dt.strftime('%Y-%m-%d')
+    
+    # 2. Numbers: Force to float, fill None with 0.0
     df_save['Amount'] = pd.to_numeric(df_save['Amount'], errors='coerce').fillna(0.0)
     df_save['IVA'] = pd.to_numeric(df_save['IVA'], errors='coerce').fillna(0.0)
+    
+    # 3. Boolean: Force Is_Vice to True/False
     df_save['Is_Vice'] = df_save['Is_Vice'].fillna(False).astype(bool)
-    for c in ['Vendor', 'Item', 'Currency', 'Category']: df_save[c] = df_save[c].astype(str).replace('nan', '')
+    
+    # 4. Strings: Fill NaN with empty string
+    for col in ['Vendor', 'Item', 'Currency', 'Category', 'Sub_Category', 'File']:
+        if col in df_save.columns:
+            df_save[col] = df_save[col].astype(str).replace('nan', '').replace('None', '')
+            
     conn.update(worksheet="Sheet1", data=df_save)
 
-# --- PDF GENERATOR ---
+# --- PDF ENGINE ---
 def generate_pdf_safe(df, goal_name, currency_symbol):
     try:
         pdf = FPDF()
@@ -73,15 +62,23 @@ def generate_pdf_safe(df, goal_name, currency_symbol):
         pdf.set_font("Arial", 'B', 16); pdf.cell(190, 10, "FORENSIX REPORT", 0, 1, 'C')
         pdf.set_font("Arial", size=10); pdf.cell(190, 10, f"Goal: {goal_name}", 0, 1, 'C'); pdf.ln(10)
         pdf.set_font("Arial", 'B', 12); pdf.cell(100, 10, f"Total: {currency_symbol}{df['Amount'].sum():.2f}", 1, 1)
-        pdf.set_font("Arial", '', 8)
-        pdf.ln(5)
+        pdf.set_text_color(200, 0, 0); pdf.cell(100, 10, f"Leakage: {currency_symbol}{df[df['Is_Vice']==True]['Amount'].sum():.2f}", 1, 1); pdf.set_text_color(0,0,0); pdf.ln(5)
+        
+        pdf.set_font("Arial", 'B', 8)
         pdf.cell(30, 8, "Date", 1); pdf.cell(40, 8, "Vendor", 1); pdf.cell(80, 8, "Item", 1); pdf.cell(30, 8, "Price", 1); pdf.ln()
+        
+        pdf.set_font("Arial", '', 8)
         for _, row in df.iterrows():
-            d = str(row['Date'])[:10]
-            v = str(row['Vendor'])[:15]
-            i = str(row['Item'])[:35]
-            p = f"{row['Amount']:.2f}"
-            pdf.cell(30, 6, d, 1); pdf.cell(40, 6, v, 1); pdf.cell(80, 6, i, 1); pdf.cell(30, 6, p, 1); pdf.ln()
+            safe_date = str(row['Date'])[:10]
+            safe_vend = str(row['Vendor'])[:18]
+            safe_item = str(row['Item'])[:35]
+            safe_price = f"{row['Amount']:.2f}"
+            
+            pdf.cell(30, 6, safe_date, 1)
+            pdf.cell(40, 6, safe_vend, 1)
+            pdf.cell(80, 6, safe_item, 1)
+            pdf.cell(30, 6, safe_price, 1)
+            pdf.ln()
         return pdf.output(dest='S').encode('latin-1')
     except: return None
 
@@ -94,25 +91,36 @@ def calculate_accurate_tax(gross_annual, residency, tax_code):
             try: digits = int(re.sub(r'\D', '', str(tax_code))); allowance = digits * 10
             except: pass
         if gross_annual > 100000: allowance = max(0, allowance - (gross_annual - 100000) / 2)
+        
         taxable = max(0, gross_annual - allowance)
         tax = 0.0
+        
         if taxable > 0: tax += min(taxable, 37700) * 0.20
         if taxable > 37700: tax += min(taxable - 37700, 125140 - 37700) * 0.40
         if taxable > 125140: tax += (taxable - 125140) * 0.45
+        
         ni = 0.0
         if gross_annual > 12570: ni += min(max(0, gross_annual - 12570), 50270 - 12570) * 0.08
         if gross_annual > 50270: ni += (gross_annual - 50270) * 0.02
+        
         net_annual = gross_annual - tax - ni
+        
     elif "Spain" in residency:
         ss_tax = min(gross_annual, 56646) * 0.0635
         base = gross_annual - ss_tax - 2000
-        irpf, prev = 0.0, 0
+        irpf = 0.0
         bands = [(12450, 0.19), (20200, 0.24), (35200, 0.30), (60000, 0.37), (300000, 0.45)]
+        prev = 0
         for limit, rate in bands:
-            if base > prev: irpf += (min(base, limit) - prev) * rate; prev = limit
+            if base > prev:
+                irpf += (min(base, limit) - prev) * rate
+                prev = limit
             else: break
         net_annual = gross_annual - ss_tax - irpf
-    else: net_annual = gross_annual * 0.78
+        
+    else:
+        net_annual = gross_annual * 0.78 # Default Fallback
+
     return net_annual / 12
 
 # --- AI ENGINE ---
@@ -124,25 +132,29 @@ def vision_slice_micro(image_path):
     img = cv2.imread(str(image_path))
     if img is None: return []
     h, w = img.shape[:2]
-    # IF image is small, return as 1 slice
+    
+    # Don't slice small images
     if h < 1000: return [img]
     
-    slices, start = [], 0
-    # RESTORED: Slicing Loop for Long Receipts
+    slices = []
+    start = 0
+    # Overlapping slices for long receipts
     while start < h:
         end = min(start + 1000, h)
         if (end - start) < 100 and len(slices) > 0: break 
         slices.append(img[start:end, :])
         if end == h: break
-        start += 800 # Overlap of 200px
+        start += 800 
     return slices
 
 def analyze_chunk(content_bytes, mime_type, client, user_vices, home_currency):
-    # Common function to call AI for any chunk (PDF or Image Slice)
     prompt = f"""
-    Role: Forensic Auditor. Extract items.
-    JSON Format: [{{ "d": "YYYY-MM-DD", "v": "Vendor", "n": "Item", "p": 1.00, "c": "£", "mc": "Category", "sc": "Sub", "vice": false }}]
-    Rules: Currency default {home_currency}. Vice keywords: {user_vices}.
+    Role: Forensic Auditor. Extract items from receipt.
+    Output JSON: [{{ "d": "YYYY-MM-DD", "v": "Vendor", "n": "Item", "p": 1.00, "c": "£", "mc": "Category", "sc": "Sub", "vice": false }}]
+    Rules: 
+    1. Currency default {home_currency}. 
+    2. Vice keywords: {user_vices}.
+    3. Return ONLY valid JSON array.
     """
     try:
         res = client.models.generate_content(
@@ -152,8 +164,10 @@ def analyze_chunk(content_bytes, mime_type, client, user_vices, home_currency):
         )
         try: data = json.loads(res.text)
         except: 
+            # Regex fallback if AI chats too much
             match = re.search(r'\[.*\]', res.text, re.DOTALL); 
             data = json.loads(match.group()) if match else []
+            
         if isinstance(data, dict): data = data.get("items", [])
         return data
     except: return []
@@ -166,11 +180,9 @@ def process_upload(uploaded_file, api_key, user_vices, home_currency):
     raw_items = []
     
     if uploaded_file.type == "application/pdf":
-        # PDF: Send whole file
         with open(temp_path, "rb") as f:
             raw_items.extend(analyze_chunk(f.read(), "application/pdf", client, user_vices, home_currency))
     else:
-        # IMAGE: Slice it!
         slices = vision_slice_micro(temp_path)
         bar = st.progress(0)
         for i, s in enumerate(slices):
@@ -181,13 +193,19 @@ def process_upload(uploaded_file, api_key, user_vices, home_currency):
 
     os.remove(temp_path)
     
-    # Format into DataFrame
+    # Convert to DataFrame columns expected by app
     extracted = []
     for i in raw_items:
         extracted.append({
-            "Date": i.get("d"), "Vendor": i.get("v"), "Item": i.get("n"), "Amount": i.get("p", 0.0),
-            "Currency": i.get("c", home_currency), "Category": i.get("mc", "Shopping"),
-            "Sub_Category": i.get("sc", "General"), "Is_Vice": i.get("vice", False), "File": uploaded_file.name
+            "Date": i.get("d"), 
+            "Vendor": i.get("v"), 
+            "Item": i.get("n"), 
+            "Amount": i.get("p", 0.0),
+            "Currency": i.get("c", home_currency), 
+            "Category": i.get("mc", "Shopping"),
+            "Sub_Category": i.get("sc", "General"), 
+            "Is_Vice": i.get("vice", False), 
+            "File": uploaded_file.name
         })
         
     return pd.DataFrame(extracted)
@@ -196,53 +214,41 @@ def process_upload(uploaded_file, api_key, user_vices, home_currency):
 api_key = get_api_key()
 if not api_key: st.stop()
 
-# 1. LOAD & CHECK
-df_raw = load_data()
-missing_cols = [c for c in REQUIRED_COLS if c not in df_raw.columns]
+# 1. LOAD DATA
+df = load_data()
 
-# 2. SCHEMA VALIDATION UI
-# CRITICAL FIX: The app will STOP here if the DB is broken.
-if missing_cols or df_raw.empty:
-    st.warning("⚠️ Database Schema Mismatch (Empty or Wrong Columns)")
-    if st.button("🛠️ Repair Database Schema"):
-        repair_sheet()
-        st.success("Repaired! Reloading...")
-        time.sleep(1)
-        st.rerun()
-    st.stop() # <--- SAFETY BRAKE
-
-# 3. CLEAN DATAFRAME FOR UI
-df = df_raw.copy()
-# Ensure critical columns exist before processing
-for c in REQUIRED_COLS: 
-    if c not in df.columns: df[c] = None
-
-# Sanitize
-df['Amount'] = pd.to_numeric(df['Amount'], errors='coerce').fillna(0.0)
-df['IVA'] = pd.to_numeric(df['IVA'], errors='coerce').fillna(0.0)
-df['Is_Vice'] = df['Is_Vice'].fillna(False).astype(bool)
-df['Date'] = pd.to_datetime(df['Date'], errors='coerce').fillna(pd.Timestamp.now())
-
-# 4. SIDEBAR
+# 2. SIDEBAR
 with st.sidebar:
     st.title("👤 Profile")
-    st.success("☁️ Connected")
-    residency = st.selectbox("Residency", ["UK (GBP)", "Spain (EUR)"])
+    st.success("☁️ Database Connected")
+    
+    # TAX SECTION
+    st.subheader("🌍 Tax Residency")
+    residency = st.selectbox("Select Country", ["UK (GBP)", "Spain (EUR)"], index=0)
     home_curr = "£" if "UK" in residency else "€"
-    tax_code = st.text_input("Tax Code") if "UK" in residency else ""
     
+    tax_code_input = ""
+    if "UK" in residency:
+        tax_code_input = st.text_input("Tax Code (Optional)", "1257L")
+    
+    # INCOME SECTION
+    st.subheader("💰 Income Calculator")
     col1, col2 = st.columns(2)
-    freq = col1.selectbox("Freq", ["Yearly", "Monthly"])
-    gross = col2.number_input("Gross", 35000.0, step=1000.0)
+    income_freq = col1.selectbox("Freq", ["Yearly", "Monthly", "Hourly"])
+    gross_income = col2.number_input("Gross", 35000.0, step=1000.0)
     
-    gross_annual = gross if freq == "Yearly" else gross * 12
-    net_monthly = calculate_accurate_tax(gross_annual, residency, tax_code)
-    st.metric("Net Monthly", f"{home_curr}{net_monthly:,.2f}")
+    gross_annual = 0.0
+    if income_freq == "Yearly": gross_annual = gross_income
+    elif income_freq == "Monthly": gross_annual = gross_income * 12
+    elif income_freq == "Hourly": gross_annual = gross_income * 160 * 12
     
-    st.divider()
-    goal_name = st.text_input("Goal", "Daughter's Bike")
-    goal_target = st.number_input("Target", 150.0)
-    user_vices = st.text_area("Vices", "alcohol, candy, betting")
+    net_monthly = calculate_accurate_tax(gross_annual, residency, tax_code_input)
+    st.metric("Net Monthly Income", f"{home_curr}{net_monthly:,.2f}")
+    
+    st.markdown("---")
+    goal_name = st.text_input("Goal Name", "Daughter's Bike")
+    goal_target = st.number_input("Target Amount", 150.0)
+    user_vices = st.text_area("Vices", "alcohol, candy, betting, tobacco")
     
     if not df.empty:
         st.write("### 📥 Export")
@@ -250,63 +256,94 @@ with st.sidebar:
         pdf_data = generate_pdf_safe(df, goal_name, home_curr)
         if pdf_data: st.download_button("📄 PDF", pdf_data, "report.pdf", "application/pdf")
 
-    if st.button("⚠️ Wipe DB"): repair_sheet(); st.rerun()
+# 3. MAIN DASHBOARD
+st.title(f"🎯 Project: {goal_name}")
 
-# 5. DASHBOARD
-st.title(f"🎯 {goal_name}")
+# KPIS
 col1, col2, col3, col4 = st.columns(4)
 spent = df['Amount'].sum()
-vice = df[df['Is_Vice']]['Amount'].sum()
-col1.metric("Spent", f"{home_curr}{spent:,.2f}")
-col2.metric("Remaining", f"{home_curr}{net_monthly - spent:,.2f}")
-col3.metric("Leakage", f"{home_curr}{vice:,.2f}")
-col4.progress(min(vice/goal_target, 1.0))
+vice_spend = df[df['Is_Vice']]['Amount'].sum()
+remaining = net_monthly - spent
 
-# 6. UPLOAD
-uploaded = st.file_uploader("Upload", accept_multiple_files=True)
-if uploaded and st.button("🔍 Audit"):
-    rows = []
-    for f in uploaded:
-        if f.type == "application/pdf":
-            data = process_upload(f, api_key, user_vices, home_curr)
-        else:
-            # Handle Images via Slicing Logic
-            # Note: process_upload handles file saving internally so we call it directly
-            data = process_upload(f, api_key, user_vices, home_curr)
-            
-        if not data.empty: rows.append(data)
+col1.metric("Total Spent", f"{home_curr}{spent:,.2f}")
+col2.metric("Remaining (Month)", f"{home_curr}{remaining:,.2f}")
+col3.metric("Habit Leakage", f"{home_curr}{vice_spend:,.2f}", delta="-Leakage")
+progress = min((vice_spend / goal_target), 1.0)
+col4.progress(progress)
+col4.caption(f"Goal Progress: {progress*100:.1f}%")
+
+# 4. UPLOAD SECTION
+uploaded = st.file_uploader("Upload Receipts", accept_multiple_files=True)
+if uploaded and st.button("🔍 Run Forensic Audit"):
+    all_new_rows = []
+    progress_bar = st.progress(0)
     
-    if rows:
-        combined = pd.concat(rows, ignore_index=True)
-        # Auto-Fill Logic
-        combined['Vendor'] = combined['Vendor'].fillna("Unknown").ffill().bfill()
-        combined['Date'] = pd.to_datetime(combined['Date']).ffill().bfill().fillna(pd.Timestamp.now())
-        combined['Amount'] = pd.to_numeric(combined['Amount'], errors='coerce').fillna(0.0)
-        
-        # Auto-VAT
-        def calc_vat(r):
-            rate = 20.0 if "UK" in residency else 21.0
-            if "grocery" in str(r['Category']).lower(): rate = 0.0 if "UK" in residency else 4.0
-            return round(r['Amount'] - (r['Amount'] / (1 + rate/100)), 2)
-        combined['IVA'] = combined.apply(calc_vat, axis=1)
-        
-        st.session_state.review = combined
+    for idx, file in enumerate(uploaded):
+        new_data = process_upload(file, api_key, user_vices, home_curr)
+        if not new_data.empty:
+            # Auto-Fill Logic (Vendor / Date)
+            new_data['Vendor'] = new_data['Vendor'].replace([None, 'null'], np.nan).ffill().bfill().fillna("Unknown")
+            new_data['Date'] = pd.to_datetime(new_data['Date'], errors='coerce').ffill().bfill().fillna(pd.Timestamp.now())
+            new_data['Currency'] = new_data['Currency'].fillna(home_curr)
+            
+            # Auto-VAT Logic
+            def calc_iva(row):
+                rate = 20.0 if "UK" in residency else 21.0
+                if "grocery" in str(row['Category']).lower(): rate = 0.0 if "UK" in residency else 4.0
+                return round(row['Amount'] - (row['Amount'] / (1 + rate/100)), 2)
+                
+            new_data['IVA'] = new_data.apply(calc_iva, axis=1)
+            all_new_rows.append(new_data)
+        progress_bar.progress((idx + 1) / len(uploaded))
+            
+    if all_new_rows:
+        combined_new = pd.concat(all_new_rows, ignore_index=True)
+        st.session_state.review_data = combined_new
         st.rerun()
 
-# 7. REVIEW ROOM
-if 'review' in st.session_state and st.session_state.review is not None:
-    st.info("Review Data")
-    edited = st.data_editor(st.session_state.review, num_rows="dynamic", use_container_width=True)
-    if st.button("✅ Save"):
-        final = pd.concat([df, edited], ignore_index=True)
-        save_data(final)
-        st.session_state.review = None
+# 5. REVIEW ROOM
+if 'review_data' in st.session_state and st.session_state.review_data is not None:
+    st.divider()
+    st.subheader("🧐 Review & Edit Results")
+    st.info("Edit data below to correct any AI mistakes. Click Confirm to save.")
+    
+    edited_df = st.data_editor(
+        st.session_state.review_data,
+        num_rows="dynamic",
+        use_container_width=True,
+        column_config={
+            "Date": st.column_config.DateColumn("Date", format="YYYY-MM-DD"),
+            "Amount": st.column_config.NumberColumn("Amount", format="%.2f"),
+            "Is_Vice": st.column_config.CheckboxColumn("Vice?", default=False),
+            "Category": st.column_config.SelectboxColumn("Category", options=["Groceries", "Dining", "Alcohol", "Transport", "Shopping", "Services"])
+        }
+    )
+    
+    col_save, col_cancel = st.columns([1, 4])
+    if col_save.button("✅ Confirm & Save"):
+        final_df = pd.concat([df, edited_df], ignore_index=True)
+        save_data(final_df)
+        st.session_state.review_data = None
+        st.success("Saved successfully!")
+        time.sleep(1)
+        st.rerun()
+        
+    if col_cancel.button("❌ Discard"):
+        st.session_state.review_data = None
         st.rerun()
 
-# 8. TABS
-t1, t2 = st.tabs(["📊 Analytics", "📝 Ledger"])
-with t1:
+# 6. TABS
+tab1, tab2 = st.tabs(["📊 Analytics", "📝 Ledger"])
+with tab1:
     if not df.empty:
-        st.altair_chart(alt.Chart(df).mark_bar().encode(x='Category', y='Amount', color='Category'), use_container_width=True)
-with t2:
-    if not df.empty: st.dataframe(df, use_container_width=True)
+        chart = alt.Chart(df).mark_bar().encode(
+            x=alt.X('Category', sort='-y'),
+            y='Amount',
+            color='Category'
+        )
+        st.altair_chart(chart, use_container_width=True)
+
+with tab2:
+    if not df.empty:
+        st.dataframe(df, use_container_width=True)
+
