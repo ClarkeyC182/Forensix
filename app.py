@@ -13,6 +13,7 @@ from fpdf import FPDF
 from streamlit_gsheets import GSheetsConnection
 import numpy as np
 from datetime import datetime
+import re
 
 # --- CONFIG ---
 st.set_page_config(page_title="Forensix Personal Auditor", page_icon="🕵️‍♂️", layout="wide")
@@ -20,9 +21,11 @@ BASE_DIR = Path(__file__).parent.absolute()
 DIRS = { "TEMP": BASE_DIR / "temp_uploads" }
 for d in DIRS.values(): d.mkdir(exist_ok=True)
 
-# --- SESSION STATE (The "Holding Bay") ---
+# --- SESSION STATE ---
 if 'review_data' not in st.session_state:
     st.session_state.review_data = None
+if 'last_error' not in st.session_state:
+    st.session_state.last_error = None
 
 # --- DATABASE ---
 def load_data():
@@ -40,38 +43,6 @@ def save_data(df):
     if 'Date' in df_save.columns:
         df_save['Date'] = df_save['Date'].dt.strftime('%Y-%m-%d')
     conn.update(worksheet="Sheet1", data=df_save)
-
-# --- TAX LOGIC ---
-def calculate_net_monthly(gross_annual, country):
-    # Simplified Effective Tax Rate Estimator (2025/26 Rules approx)
-    if country == "UK (GBP)":
-        # Rough UK Estimate (Tax + NI)
-        if gross_annual < 12570: net = gross_annual
-        elif gross_annual < 50000: net = gross_annual * 0.82 # ~18% eff deduction
-        else: net = gross_annual * 0.72 # Higher bracket avg
-    elif country == "Spain (EUR)":
-        # Rough Spain Estimate (IRPF + Social Security)
-        if gross_annual < 12450: net = gross_annual * 0.94
-        elif gross_annual < 20200: net = gross_annual * 0.85
-        elif gross_annual < 35200: net = gross_annual * 0.81
-        elif gross_annual < 60000: net = gross_annual * 0.75
-        else: net = gross_annual * 0.70
-    else:
-        net = gross_annual * 0.80 # General Fallback
-    
-    return net / 12
-
-def get_vat_rate(country, category):
-    # Auto-VAT based on location
-    cat = str(category).lower()
-    if country == "UK (GBP)":
-        if "grocery" in cat or "food" in cat: return 0.0 # Zero rated food
-        return 20.0 # Standard
-    elif country == "Spain (EUR)":
-        if "grocery" in cat or "bread" in cat: return 4.0 # Super reduced
-        if "dining" in cat or "restaurant" in cat: return 10.0 # Reduced
-        return 21.0 # Standard
-    return 0.0
 
 # --- ENGINE ---
 def get_api_key():
@@ -103,6 +74,8 @@ def analyze_content(content_bytes, mime_type, client, user_vices, home_currency)
     2. Look for currency (£, €, $). If missing, assume {home_currency}.
     3. Main Cat: [Groceries, Dining, Alcohol, Transport, Shopping, Utils, Services].
     4. Vice: {user_vices}
+    
+    IMPORTANT: RETURN ONLY RAW JSON ARRAY. Example: [{{ ... }}]
     """
     try:
         res = client.models.generate_content(
@@ -110,8 +83,34 @@ def analyze_content(content_bytes, mime_type, client, user_vices, home_currency)
             contents=[prompt, types.Part.from_bytes(data=content_bytes, mime_type=mime_type)],
             config=types.GenerateContentConfig(response_mime_type='application/json')
         )
-        data = json.loads(res.text)
-        items = data.get("items", []) if isinstance(data, dict) else []
+        
+        # --- THE HUNTER-SEEKER PARSER ---
+        raw = res.text
+        # 1. Try strict JSON load
+        try:
+            data = json.loads(raw)
+        except:
+            # 2. If fail, Regex hunt for the [...] list
+            match = re.search(r'\[.*\]', raw, re.DOTALL)
+            if match:
+                data = json.loads(match.group())
+            else:
+                # 3. If fail, Regex hunt for { ... } object
+                match = re.search(r'\{.*\}', raw, re.DOTALL)
+                if match:
+                    data = json.loads(match.group())
+                else:
+                    st.session_state.last_error = f"AI Parse Fail: {raw[:100]}..."
+                    return []
+
+        # Normalize Data Structure
+        if isinstance(data, dict): 
+            items = data.get("items", []) or data.get("receipts", [])
+        elif isinstance(data, list):
+            items = data
+        else:
+            items = []
+
         clean_items = []
         for i in items:
             clean_items.append({
@@ -125,13 +124,17 @@ def analyze_content(content_bytes, mime_type, client, user_vices, home_currency)
                 "Is_Vice": i.get("vice", False)
             })
         return clean_items
-    except: return []
+    except Exception as e:
+        st.session_state.last_error = f"API Error: {str(e)}"
+        return []
 
 def process_upload(uploaded_file, api_key, user_vices, home_currency):
     temp_path = DIRS['TEMP'] / uploaded_file.name
     with open(temp_path, "wb") as f: f.write(uploaded_file.getbuffer())
     client = genai.Client(api_key=api_key)
     extracted_items = []
+    
+    # Process
     if uploaded_file.type == "application/pdf":
         with open(temp_path, "rb") as f: extracted_items.extend(analyze_content(f.read(), "application/pdf", client, user_vices, home_currency))
     else:
@@ -144,6 +147,7 @@ def process_upload(uploaded_file, api_key, user_vices, home_currency):
         time.sleep(0.2); bar.empty()
     os.remove(temp_path)
     
+    # Intelligent Fill
     if extracted_items:
         df_temp = pd.DataFrame(extracted_items)
         if 'Vendor' in df_temp.columns:
@@ -193,28 +197,35 @@ with st.sidebar:
     st.title("👤 Profile")
     st.success("☁️ Database Connected")
     
-    # 1. TAX & CURRENCY SETTINGS
-    st.markdown("### 🌍 Residency")
-    residency = st.selectbox("Tax Residency", ["UK (GBP)", "Spain (EUR)"], index=1) # Default Spain based on user context
+    st.markdown("### 🌍 Residency & Tax")
+    residency = st.selectbox("Tax Residency", ["UK (GBP)", "Spain (EUR)"], index=1)
     home_currency = "£" if "UK" in residency else "€"
     
-    # 2. NET INCOME CALCULATOR
-    st.markdown("### 💰 Income (Auto-Tax)")
+    # MANUAL TAX OVERRIDE
+    use_manual_tax = st.checkbox("I know my Tax Rate", value=False)
+    if use_manual_tax:
+        manual_tax_rate = st.slider("Effective Tax Rate (%)", 0, 60, 20, help="E.g. If you earn £30k, your eff. rate is ~18%")
+    
+    st.markdown("### 💰 Income")
     col_inc1, col_inc2 = st.columns(2)
     income_freq = col_inc1.selectbox("Freq", ["Yearly", "Monthly", "Hourly"])
-    gross_income = col_inc2.number_input("Gross Amount", value=35000.0, step=1000.0)
+    gross_income = col_inc2.number_input("Gross", value=35000.0, step=1000.0)
     
-    # Calculate Net Monthly
     gross_annual = 0.0
     if income_freq == "Yearly": gross_annual = gross_income
     elif income_freq == "Monthly": gross_annual = gross_income * 12
     elif income_freq == "Hourly": gross_annual = gross_income * 160 * 12
     
-    net_monthly = calculate_net_monthly(gross_annual, residency)
-    
-    st.metric("Est. Net Monthly", f"{home_currency}{net_monthly:,.2f}", help="Estimated after Tax/NI/Social Security")
+    # NET CALC
+    if use_manual_tax:
+        net_annual = gross_annual * (1 - (manual_tax_rate/100))
+    else:
+        # Auto Logic
+        net_annual = gross_annual * 0.78 # Default Fallback
+        
+    net_monthly = net_annual / 12
+    st.metric("Est. Net Monthly", f"{home_currency}{net_monthly:,.2f}")
 
-    # 3. DATE FILTER
     st.markdown("---")
     st.markdown("### 📅 Time Travel")
     if not df.empty:
@@ -250,7 +261,6 @@ with st.sidebar:
 
 st.title(f"🎯 Project: {goal_name}")
 
-# KPIS
 col1, col2, col3, col4 = st.columns(4)
 month_spend = filtered_df['Amount'].sum()
 month_tax = filtered_df['IVA'].sum()
@@ -266,6 +276,9 @@ st.progress(progress / 100)
 
 uploaded = st.file_uploader("Upload Receipts", accept_multiple_files=True, type=['png', 'jpg', 'jpeg', 'pdf'])
 if uploaded and st.button("🔍 Run Forensic Audit"):
+    # Clear previous error
+    st.session_state.last_error = None
+    
     new_rows = []
     for f in uploaded:
         with st.spinner(f"Analyzing {f.name}..."):
@@ -274,8 +287,11 @@ if uploaded and st.button("🔍 Run Forensic Audit"):
                 try: price = float(item.get('Amount', 0))
                 except: price = 0.0
                 
-                # Smart VAT Calculation based on Residency
-                vat_rate = get_vat_rate(residency, item.get('Category', ''))
+                # Simple VAT
+                cat = str(item.get('Category','')).lower()
+                vat_rate = 21.0
+                if "grocery" in cat: vat_rate = 4.0
+                
                 iva = round(price - (price / (1 + (vat_rate / 100))), 2)
                 
                 try: r_date = pd.to_datetime(item.get('Date')).strftime('%Y-%m-%d')
@@ -295,16 +311,17 @@ if uploaded and st.button("🔍 Run Forensic Audit"):
                 })
     
     if new_rows:
-        # STORE IN SESSION STATE TO PREVENT DATA LOSS
         st.session_state.review_data = pd.DataFrame(new_rows)
         st.rerun()
+    elif st.session_state.last_error:
+        st.error(f"❌ Analysis Failed: {st.session_state.last_error}")
+    else:
+        st.warning("No items found. Try a clearer image.")
 
-# --- THE STICKY REVIEW ROOM ---
 if st.session_state.review_data is not None:
     st.write("### 🧐 Review & Edit Results")
-    st.info("Data is held here safely. Edit below, then click Confirm to save.")
+    st.info("Data held safely. Edit then confirm.")
     
-    # ADVANCED EDITOR: Dropdowns for Currency and Categories
     edited_new_df = st.data_editor(
         st.session_state.review_data, 
         num_rows="dynamic", 
@@ -320,12 +337,12 @@ if st.session_state.review_data is not None:
     if col_save.button("✅ Confirm & Save"):
         updated_df = pd.concat([df, edited_new_df], ignore_index=True)
         save_data(updated_df)
-        st.session_state.review_data = None # Clear holding bay
-        st.success(f"Saved to Cloud!")
+        st.session_state.review_data = None
+        st.success(f"Saved!")
         time.sleep(1)
         st.rerun()
         
-    if col_discard.button("❌ Discard All"):
+    if col_discard.button("❌ Discard"):
         st.session_state.review_data = None
         st.rerun()
 
@@ -359,4 +376,3 @@ with tab3:
             st.success(f"**Good Job:** Your vice spending is under control ({vice_percent:.1f}%).")
     else:
         st.info("Upload data to generate insights.")
-
