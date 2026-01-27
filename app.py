@@ -107,13 +107,8 @@ def vision_slice_micro(image_path):
     img = cv2.imread(str(image_path))
     if img is None: return []
     h, w = img.shape[:2]
-    
-    # If image is small-ish (under 2500px tall), just send it whole
     if h < 2500: return [img]
-    
-    slices = []
-    start = 0
-    # Create overlapping slices (1500px tall, 300px overlap)
+    slices, start = [], 0
     while start < h:
         end = min(start + 1500, h)
         if (end - start) < 200 and len(slices) > 0: break 
@@ -132,10 +127,11 @@ def analyze_chunk(content_bytes, mime_type, client, user_vices, home_currency):
     
     RULES:
     1. **NO TOTALS:** Ignore 'Total', 'Subtotal', 'Balance', 'Change'.
-    2. **VENDOR LOGIC:** If you see a logo/header, output the Vendor Name. If this is the middle of a long list and NO header is visible, output 'CONT' (for Continuation).
-    3. **CATEGORY:** [Groceries, Alcohol, Dining, Transport, Shopping, Utilities, Services].
-    4. **VICES:** {user_vices}.
-    5. **CURRENCY:** Default {home_currency}. 
+    2. **VENDOR LOGIC:** If you see a logo/header, output the Vendor Name. If this is the middle of a long list and NO header is visible, output 'CONT'.
+    3. **CATEGORY (mc):** [Groceries, Alcohol, Dining, Transport, Shopping, Utilities, Services].
+    4. **SUB-CATEGORY (sc):** Be specific (e.g., 'Dairy', 'Meat', 'Snacks', 'Fuel', 'Clothes').
+    5. **VICES:** {user_vices}.
+    6. **CURRENCY:** Default {home_currency}. 
     """
     try:
         res = client.models.generate_content(
@@ -165,7 +161,6 @@ def process_upload(uploaded_file, api_key, user_vices, home_currency):
             with open(temp_path, "rb") as f:
                 raw_items.extend(analyze_chunk(f.read(), "application/pdf", client, user_vices, home_currency))
         else:
-            # RESTORED SLICING for large images
             slices = vision_slice_micro(temp_path)
             bar = st.progress(0)
             for i, s in enumerate(slices):
@@ -177,7 +172,7 @@ def process_upload(uploaded_file, api_key, user_vices, home_currency):
         if os.path.exists(temp_path): os.remove(temp_path)
     
     extracted = []
-    last_known_vendor = "Unknown" # Tracking variable for slices
+    last_known_vendor = "Unknown" 
 
     for i in raw_items:
         # 1. Total Filter
@@ -195,13 +190,11 @@ def process_upload(uploaded_file, api_key, user_vices, home_currency):
             except: pass
 
         # 3. VENDOR STITCHING
-        # If AI says 'CONT' or 'Unknown', use the last good vendor we saw.
-        # If AI finds a NEW vendor (e.g. 'Spar'), update our tracker.
         raw_vendor = str(i.get("v", "Unknown"))
         if raw_vendor.upper() not in ["UNKNOWN", "CONT", "NONE", "NULL"]:
-            last_known_vendor = raw_vendor # We found a new header!
+            last_known_vendor = raw_vendor
             
-        # 4. Typo Fixer (Applied to the 'stitched' vendor)
+        # 4. Typo Fixer
         vendor = last_known_vendor.upper()
         if "SPAN" in vendor: vendor = "SPAR"
         if "MERCAD" in vendor: vendor = "MERCADONA"
@@ -210,14 +203,13 @@ def process_upload(uploaded_file, api_key, user_vices, home_currency):
         
         # 5. Smart Categories
         cat = str(i.get("mc", "Unknown"))
+        sub_cat = str(i.get("sc", "General"))
         is_vice = bool(i.get("vice", False))
         
-        # Fix category misses
         if cat in ["Unknown", "Shopping", "None"]:
             if vendor in ["MERCADONA", "LIDL", "SPAR", "TESCO", "ALDI"]: cat = "Groceries"
             elif vendor in ["ALE-HOP", "AMAZON"]: cat = "Shopping"
 
-        # Force Vices
         vice_keywords = ["chocolate", "candy", "betting", "tobacco", "cigar", "wine", "beer", "cerveza", "vino", "vodka", "ron", "gin"]
         if any(v in name_lower for v in vice_keywords):
             is_vice = True
@@ -230,7 +222,7 @@ def process_upload(uploaded_file, api_key, user_vices, home_currency):
         extracted.append({
             "Date": i.get("d"), "Vendor": vendor, "Item": name, 
             "Amount": price, "Currency": i.get("c", home_currency), 
-            "Category": cat, "Sub_Category": i.get("sc", "General"), 
+            "Category": cat, "Sub_Category": sub_cat, 
             "Is_Vice": is_vice, "File": uploaded_file.name
         })
     return pd.DataFrame(extracted)
@@ -353,7 +345,6 @@ if 'review_data' in st.session_state and st.session_state.review_data is not Non
         column_config={
             "Date": st.column_config.DateColumn("Date", format="YYYY-MM-DD"),
             "Amount": st.column_config.NumberColumn("Amount", format="%.2f"),
-            "Is_Vice": st.column_config.CheckboxColumn("Vice?", default=False),
             "Category": st.column_config.SelectboxColumn("Category", options=["Groceries", "Alcohol", "Dining", "Transport", "Shopping", "Utilities", "Services"])
         }
     )
@@ -366,11 +357,50 @@ if 'review_data' in st.session_state and st.session_state.review_data is not Non
     if st.button("❌ Discard"):
         st.session_state.review_data = None; st.rerun()
 
-# 6. TABS
-t1, t2 = st.tabs(["Analytics", "Ledger"])
+# 6. ANALYTICS SUITE (The New Code)
+t1, t2 = st.tabs(["📊 Analytics", "📝 Ledger"])
 with t1:
     if not df.empty:
-        st.altair_chart(alt.Chart(df).mark_bar().encode(x='Category', y='Amount', color='Category'), use_container_width=True)
+        c1, c2 = st.columns(2)
+        
+        # CHART 1: Stacked Bar (Category + Sub_Category Breakdown)
+        with c1:
+            st.subheader("Spending Breakdown")
+            chart = alt.Chart(df).mark_bar().encode(
+                x=alt.X('Category', sort='-y'),
+                y='Amount',
+                color='Sub_Category',
+                tooltip=['Item', 'Amount', 'Sub_Category']
+            ).interactive()
+            st.altair_chart(chart, use_container_width=True)
+            
+        # CHART 2: Vice Watch (Donut Chart)
+        with c2:
+            st.subheader("The 'Vice' Meter")
+            base = alt.Chart(df).encode(theta=alt.Theta("Amount", stack=True))
+            pie = base.mark_arc(outerRadius=120).encode(
+                color=alt.Color("Is_Vice"),
+                order=alt.Order("Amount", sort="descending"),
+                tooltip=["Is_Vice", "Amount"]
+            )
+            text = base.mark_text(radius=140).encode(
+                text=alt.Text("Amount", format=".1f"),
+                order=alt.Order("Amount", sort="descending"),
+                color=alt.value("black") 
+            )
+            st.altair_chart(pie + text, use_container_width=True)
+            
+        # CHART 3: Daily Trend Line
+        st.subheader("Spending Timeline")
+        line = alt.Chart(df).mark_line(point=True).encode(
+            x='Date',
+            y='Amount',
+            color='Category',
+            tooltip=['Date', 'Vendor', 'Amount']
+        ).interactive()
+        st.altair_chart(line, use_container_width=True)
+
 with t2:
-    if not df.empty: st.dataframe(df, use_container_width=True)
+    if not df.empty: 
+        st.dataframe(df, use_container_width=True)
         
