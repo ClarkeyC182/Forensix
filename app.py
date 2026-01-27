@@ -103,10 +103,9 @@ def get_api_key():
     return ""
 
 def resize_image_if_needed(image_path):
-    """Resizes only if MASSIVE. Increased limit to 5000px for clearer text."""
     try:
         with Image.open(image_path) as img:
-            if img.width > 5000: # Increased from 3000 to 5000
+            if img.width > 5000:
                 ratio = 5000 / img.width
                 new_height = int(img.height * ratio)
                 img = img.resize((5000, new_height), Image.Resampling.LANCZOS)
@@ -114,22 +113,22 @@ def resize_image_if_needed(image_path):
     except: pass
 
 def analyze_full_image(content_bytes, mime_type, client, user_vices, home_currency):
-    # DENSITY PROMPT: Explicitly asking for every single line
+    # CATEGORY-AWARE PROMPT
     prompt = f"""
     Role: Senior OCR Specialist.
-    Context: A collage of receipts. 
-    Task: Extract EVERY SINGLE line item from EVERY receipt. Do not skip small items.
+    Context: Collage of receipts. Extract EVERY line item.
     
     JSON: [{{ "d": "YYYY-MM-DD", "v": "Vendor", "n": "Item Name", "p": 1.00, "c": "£", "mc": "Category", "sc": "Sub", "vice": false }}]
     
     RULES:
     1. **NO TOTALS:** Ignore 'Total', 'Subtotal', 'Balance', 'Change'.
-    2. **ITEM NAME:** Must be the product name. Do NOT put the price in the Item Name field.
-    3. **PRICE:** Ensure the price is in the 'p' field. 
-    4. **VENDOR:** Look at the header of the specific receipt paper the item is on.
-    5. **DATE:** Find the date on that specific receipt paper.
-    6. **CURRENCY:** Default {home_currency}. 
-    7. **VICES:** Check: {user_vices}.
+    2. **ITEM NAME:** Product name only. No prices in name.
+    3. **CATEGORY (mc):** Choose from: [Groceries, Alcohol, Dining, Transport, Shopping, Utilities, Services].
+    4. **VICE CHECK:** If item is alcohol, candy, tobacco, gambling -> vice = true.
+    5. **VENDOR:** Header of the specific receipt.
+    6. **DATE:** Date of the specific receipt.
+    7. **CURRENCY:** Default {home_currency}. 
+    8. **USER VICES:** {user_vices}.
     """
     try:
         res = client.models.generate_content(
@@ -151,7 +150,6 @@ def process_upload(uploaded_file, api_key, user_vices, home_currency):
     
     with open(temp_path, "wb") as f: f.write(uploaded_file.getbuffer())
     
-    # Resize (Less aggressive now)
     if uploaded_file.type != "application/pdf":
         resize_image_if_needed(temp_path)
         
@@ -161,7 +159,7 @@ def process_upload(uploaded_file, api_key, user_vices, home_currency):
     try:
         mime = "application/pdf" if uploaded_file.type == "application/pdf" else "image/jpeg"
         with open(temp_path, "rb") as f:
-            raw_items = analyze_full_image(f.read(), mime, client, user_vices, home_currency)
+            raw_items.extend(analyze_full_image(f.read(), mime, client, user_vices, home_currency))
     finally:
         if os.path.exists(temp_path): os.remove(temp_path)
     
@@ -174,12 +172,11 @@ def process_upload(uploaded_file, api_key, user_vices, home_currency):
         
         price = safe_float(i.get("p"))
         
-        # 2. PRICE SWAP LOGIC (Fixes "GAME 21.28" error)
-        # If Item Name looks like a number (e.g. "21.28") and Price is 0... Swap them!
+        # 2. Price Swap Fix
         if price == 0.0 and re.match(r'^\d+\.?\d*$', name):
             try:
                 price = float(name)
-                name = "Unidentified Item" # Swap name to generic
+                name = "Unidentified Item"
             except: pass
 
         # 3. Typo Fixer
@@ -189,16 +186,36 @@ def process_upload(uploaded_file, api_key, user_vices, home_currency):
         if "LID" in vendor: vendor = "LIDL"
         if "ALE" in vendor and "HOP" in vendor: vendor = "ALE-HOP"
         
-        cat = str(i.get("mc", "Shopping"))
+        # 4. SMART CATEGORIZER (Python Fallback)
+        cat = str(i.get("mc", "Unknown"))
+        is_vice = bool(i.get("vice", False))
         
-        # 4. Lemon Filter
+        # Force obvious categories if AI missed them
+        if cat in ["Unknown", "Shopping", "None"]:
+            if vendor in ["MERCADONA", "LIDL", "SPAR", "TESCO", "ALDI"]:
+                cat = "Groceries"
+            elif vendor in ["ALE-HOP", "AMAZON"]:
+                cat = "Shopping"
+            elif "UBER" in vendor or "BOLT" in vendor:
+                cat = "Transport"
+
+        # Force Vices based on Keywords (The "Chocolate" Fix)
+        vice_keywords = ["chocolate", "candy", "wine", "beer", "cerveza", "vino", "betting", "tobacco", "cigar", "vodka", "ron", "gin"]
+        if any(v in name_lower for v in vice_keywords):
+            is_vice = True
+            if "vino" in name_lower or "cerveza" in name_lower or "ron" in name_lower:
+                cat = "Alcohol"
+            elif "chocolate" in name_lower or "candy" in name_lower:
+                cat = "Groceries" # Or "Snacks" if you prefer
+
+        # 5. Lemon Filter
         if price > 100 and cat in ["Groceries", "Dining", "Alcohol"]: price = price / 100.0
 
         extracted.append({
             "Date": i.get("d"), "Vendor": vendor, "Item": name, 
             "Amount": price, "Currency": i.get("c", home_currency), 
             "Category": cat, "Sub_Category": i.get("sc", "General"), 
-            "Is_Vice": i.get("vice", False), "File": uploaded_file.name
+            "Is_Vice": is_vice, "File": uploaded_file.name
         })
     return pd.DataFrame(extracted)
 
@@ -320,7 +337,8 @@ if 'review_data' in st.session_state and st.session_state.review_data is not Non
         column_config={
             "Date": st.column_config.DateColumn("Date", format="YYYY-MM-DD"),
             "Amount": st.column_config.NumberColumn("Amount", format="%.2f"),
-            "Category": st.column_config.SelectboxColumn("Category", options=["Groceries", "Dining", "Alcohol", "Transport", "Shopping"])
+            "Is_Vice": st.column_config.CheckboxColumn("Vice?", default=False),
+            "Category": st.column_config.SelectboxColumn("Category", options=["Groceries", "Alcohol", "Dining", "Transport", "Shopping", "Utilities", "Services"])
         }
     )
     if st.button("✅ Save"):
@@ -339,5 +357,3 @@ with t1:
         st.altair_chart(alt.Chart(df).mark_bar().encode(x='Category', y='Amount', color='Category'), use_container_width=True)
 with t2:
     if not df.empty: st.dataframe(df, use_container_width=True)
-
-    
