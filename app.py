@@ -33,10 +33,17 @@ def safe_float(val):
     except: return 0.0
 
 def safe_date(val):
+    """
+    Parses dates with a preference for DAY-FIRST (UK/EU Standard).
+    Fixes the 'April vs October' confusion.
+    """
     try:
         s = str(val).strip().lower()
         if s in ['none', 'null', 'nan', '', 'yyyy-mm-dd', 'unknown']: return pd.Timestamp.now()
-        dt = pd.to_datetime(val, errors='coerce')
+        
+        # dayfirst=True forces 04/10 to be Oct 4th, not Apr 10th
+        dt = pd.to_datetime(val, errors='coerce', dayfirst=True)
+        
         return pd.Timestamp.now() if pd.isna(dt) else dt
     except: return pd.Timestamp.now()
 
@@ -102,36 +109,32 @@ def get_api_key():
     if "GEMINI_API_KEY" in st.secrets: return st.secrets["GEMINI_API_KEY"]
     return ""
 
-def vision_slice_micro(image_path):
-    """Slices huge images into overlapping chunks to maintain OCR clarity."""
-    img = cv2.imread(str(image_path))
-    if img is None: return []
-    h, w = img.shape[:2]
-    if h < 2500: return [img]
-    slices, start = [], 0
-    while start < h:
-        end = min(start + 1500, h)
-        if (end - start) < 200 and len(slices) > 0: break 
-        slices.append(img[start:end, :])
-        if end == h: break
-        start += 1200 
-    return slices
+def resize_image_if_needed(image_path):
+    try:
+        with Image.open(image_path) as img:
+            if img.width > 5000:
+                ratio = 5000 / img.width
+                new_height = int(img.height * ratio)
+                img = img.resize((5000, new_height), Image.Resampling.LANCZOS)
+                img.save(image_path, optimize=True, quality=85)
+    except: pass
 
-def analyze_chunk(content_bytes, mime_type, client, user_vices, home_currency):
-    # HYBRID PROMPT: Handles both Context & Content
+def analyze_full_image(content_bytes, mime_type, client, user_vices, home_currency):
     prompt = f"""
-    Role: Forensic Auditor.
-    Task: Extract lines from this receipt slice.
+    Role: Senior OCR Specialist.
+    Context: Collage of receipts. Extract EVERY line item.
     
     JSON: [{{ "d": "YYYY-MM-DD", "v": "Vendor", "n": "Item Name", "p": 1.00, "c": "£", "mc": "Category", "sc": "Sub", "vice": false }}]
     
     RULES:
     1. **NO TOTALS:** Ignore 'Total', 'Subtotal', 'Balance', 'Change'.
-    2. **VENDOR LOGIC:** If you see a logo/header, output the Vendor Name. If this is the middle of a long list and NO header is visible, output 'CONT'.
+    2. **ITEM NAME:** Product name only. No prices in name.
     3. **CATEGORY (mc):** [Groceries, Alcohol, Dining, Transport, Shopping, Utilities, Services].
-    4. **SUB-CATEGORY (sc):** Be specific (e.g., 'Dairy', 'Meat', 'Snacks', 'Fuel', 'Clothes').
-    5. **VICES:** {user_vices}.
-    6. **CURRENCY:** Default {home_currency}. 
+    4. **VICE CHECK:** If item is alcohol, candy, tobacco, gambling -> vice = true.
+    5. **VENDOR:** Header of the specific receipt.
+    6. **DATE:** Date of the specific receipt.
+    7. **CURRENCY:** Default {home_currency}. 
+    8. **USER VICES:** {user_vices}.
     """
     try:
         res = client.models.generate_content(
@@ -153,26 +156,21 @@ def process_upload(uploaded_file, api_key, user_vices, home_currency):
     
     with open(temp_path, "wb") as f: f.write(uploaded_file.getbuffer())
     
+    if uploaded_file.type != "application/pdf":
+        resize_image_if_needed(temp_path)
+        
     client = genai.Client(api_key=api_key)
     raw_items = []
     
     try:
-        if uploaded_file.type == "application/pdf":
-            with open(temp_path, "rb") as f:
-                raw_items.extend(analyze_chunk(f.read(), "application/pdf", client, user_vices, home_currency))
-        else:
-            slices = vision_slice_micro(temp_path)
-            bar = st.progress(0)
-            for i, s in enumerate(slices):
-                _, buf = cv2.imencode(".jpg", s)
-                raw_items.extend(analyze_chunk(buf.tobytes(), "image/jpeg", client, user_vices, home_currency))
-                bar.progress((i + 1) / len(slices))
-            time.sleep(0.2); bar.empty()
+        mime = "application/pdf" if uploaded_file.type == "application/pdf" else "image/jpeg"
+        with open(temp_path, "rb") as f:
+            raw_items.extend(analyze_full_image(f.read(), mime, client, user_vices, home_currency))
     finally:
         if os.path.exists(temp_path): os.remove(temp_path)
     
     extracted = []
-    last_known_vendor = "Unknown" 
+    last_known_vendor = "Unknown"
 
     for i in raw_items:
         # 1. Total Filter
@@ -182,28 +180,26 @@ def process_upload(uploaded_file, api_key, user_vices, home_currency):
         
         price = safe_float(i.get("p"))
         
-        # 2. Price Swap Fix
+        # 2. Price Swap
         if price == 0.0 and re.match(r'^\d+\.?\d*$', name):
             try:
                 price = float(name)
                 name = "Unidentified Item"
             except: pass
 
-        # 3. VENDOR STITCHING
+        # 3. Stitching
         raw_vendor = str(i.get("v", "Unknown"))
         if raw_vendor.upper() not in ["UNKNOWN", "CONT", "NONE", "NULL"]:
             last_known_vendor = raw_vendor
             
-        # 4. Typo Fixer
         vendor = last_known_vendor.upper()
         if "SPAN" in vendor: vendor = "SPAR"
         if "MERCAD" in vendor: vendor = "MERCADONA"
         if "LID" in vendor: vendor = "LIDL"
         if "ALE" in vendor and "HOP" in vendor: vendor = "ALE-HOP"
         
-        # 5. Smart Categories
+        # 4. Smart Categories
         cat = str(i.get("mc", "Unknown"))
-        sub_cat = str(i.get("sc", "General"))
         is_vice = bool(i.get("vice", False))
         
         if cat in ["Unknown", "Shopping", "None"]:
@@ -216,13 +212,13 @@ def process_upload(uploaded_file, api_key, user_vices, home_currency):
             if any(k in name_lower for k in ["wine", "beer", "cerveza", "vino", "vodka", "ron"]): cat = "Alcohol"
             elif "chocolate" in name_lower or "candy" in name_lower: cat = "Groceries"
 
-        # 6. Lemon Filter
+        # 5. Lemon Filter
         if price > 100 and cat in ["Groceries", "Dining", "Alcohol"]: price = price / 100.0
 
         extracted.append({
             "Date": i.get("d"), "Vendor": vendor, "Item": name, 
             "Amount": price, "Currency": i.get("c", home_currency), 
-            "Category": cat, "Sub_Category": sub_cat, 
+            "Category": cat, "Sub_Category": i.get("sc", "General"), 
             "Is_Vice": is_vice, "File": uploaded_file.name
         })
     return pd.DataFrame(extracted)
@@ -284,6 +280,24 @@ with st.sidebar:
     goal_target = st.number_input("Target", 150.0)
     user_vices = st.text_area("Vices", "alcohol, candy, betting")
     
+    # FILTERING LOGIC
+    st.divider()
+    st.subheader("🔍 Filters")
+    
+    # Date Filter
+    min_date = df['Date'].min().date() if not df.empty else datetime.now().date()
+    max_date = df['Date'].max().date() if not df.empty else datetime.now().date()
+    
+    # If single date, add buffer to sliders
+    if min_date == max_date:
+        min_date = min_date - pd.Timedelta(days=1)
+        
+    date_range = st.slider("Date Range", min_value=min_date, max_value=max_date, value=(min_date, max_date))
+    
+    # Category Filter
+    all_cats = list(df['Category'].unique()) if not df.empty else []
+    selected_cats = st.multiselect("Category", all_cats, default=all_cats)
+    
     if st.button("⚠️ Force Clear DB"):
         conn = st.connection("gsheets", type=GSheetsConnection)
         conn.update(worksheet="Sheet1", data=pd.DataFrame(columns=REQUIRED_COLS))
@@ -295,17 +309,24 @@ with st.sidebar:
         pdf = generate_pdf_safe(df, goal_name, home_curr)
         if pdf: st.download_button("PDF", pdf, "report.pdf")
 
-# 3. DASHBOARD
+# 3. FILTER ENGINE
+df_filtered = df.copy()
+if not df.empty:
+    mask = (df['Date'].dt.date >= date_range[0]) & (df['Date'].dt.date <= date_range[1])
+    mask &= (df['Category'].isin(selected_cats))
+    df_filtered = df.loc[mask]
+
+# 4. DASHBOARD
 st.title(f"🎯 {goal_name}")
 col1, col2, col3, col4 = st.columns(4)
-spent = df['Amount'].sum()
-vice = df[df['Is_Vice']]['Amount'].sum()
+spent = df_filtered['Amount'].sum()
+vice = df_filtered[df_filtered['Is_Vice']]['Amount'].sum()
 col1.metric("Spent", f"{home_curr}{spent:,.2f}")
 col2.metric("Remaining", f"{home_curr}{net_monthly - spent:,.2f}")
 col3.metric("Leakage", f"{home_curr}{vice:,.2f}")
 col4.progress(min(vice/goal_target, 1.0) if goal_target > 0 else 0)
 
-# 4. UPLOAD
+# 5. UPLOAD
 uploaded = st.file_uploader("Upload", accept_multiple_files=True)
 if uploaded and st.button("🔍 Audit"):
     rows = []
@@ -334,7 +355,7 @@ if uploaded and st.button("🔍 Audit"):
         st.session_state.review_data = combined
         st.rerun()
 
-# 5. REVIEW
+# 6. REVIEW
 if 'review_data' in st.session_state and st.session_state.review_data is not None:
     st.divider()
     st.info("Review Data")
@@ -345,6 +366,7 @@ if 'review_data' in st.session_state and st.session_state.review_data is not Non
         column_config={
             "Date": st.column_config.DateColumn("Date", format="YYYY-MM-DD"),
             "Amount": st.column_config.NumberColumn("Amount", format="%.2f"),
+            "Is_Vice": st.column_config.CheckboxColumn("Vice?", default=False),
             "Category": st.column_config.SelectboxColumn("Category", options=["Groceries", "Alcohol", "Dining", "Transport", "Shopping", "Utilities", "Services"])
         }
     )
@@ -357,27 +379,25 @@ if 'review_data' in st.session_state and st.session_state.review_data is not Non
     if st.button("❌ Discard"):
         st.session_state.review_data = None; st.rerun()
 
-# 6. ANALYTICS SUITE (The New Code)
-t1, t2 = st.tabs(["📊 Analytics", "📝 Ledger"])
+# 7. ANALYTICS SUITE (Interactive)
+t1, t2 = st.tabs(["📊 Executive View", "📝 Data Ledger"])
 with t1:
-    if not df.empty:
+    if not df_filtered.empty:
         c1, c2 = st.columns(2)
         
-        # CHART 1: Stacked Bar (Category + Sub_Category Breakdown)
         with c1:
-            st.subheader("Spending Breakdown")
-            chart = alt.Chart(df).mark_bar().encode(
+            st.subheader("💸 Where is the money going?")
+            chart = alt.Chart(df_filtered).mark_bar().encode(
                 x=alt.X('Category', sort='-y'),
                 y='Amount',
-                color='Sub_Category',
-                tooltip=['Item', 'Amount', 'Sub_Category']
+                color='Category',
+                tooltip=['Category', 'Amount']
             ).interactive()
             st.altair_chart(chart, use_container_width=True)
             
-        # CHART 2: Vice Watch (Donut Chart)
         with c2:
-            st.subheader("The 'Vice' Meter")
-            base = alt.Chart(df).encode(theta=alt.Theta("Amount", stack=True))
+            st.subheader("😈 The Vice Meter")
+            base = alt.Chart(df_filtered).encode(theta=alt.Theta("Amount", stack=True))
             pie = base.mark_arc(outerRadius=120).encode(
                 color=alt.Color("Is_Vice"),
                 order=alt.Order("Amount", sort="descending"),
@@ -390,17 +410,29 @@ with t1:
             )
             st.altair_chart(pie + text, use_container_width=True)
             
-        # CHART 3: Daily Trend Line
-        st.subheader("Spending Timeline")
-        line = alt.Chart(df).mark_line(point=True).encode(
-            x='Date',
-            y='Amount',
-            color='Category',
-            tooltip=['Date', 'Vendor', 'Amount']
-        ).interactive()
-        st.altair_chart(line, use_container_width=True)
+        c3, c4 = st.columns(2)
+        
+        with c3:
+            st.subheader("🏆 Top 5 Vendors")
+            top_vendors = df_filtered.groupby("Vendor")['Amount'].sum().reset_index().sort_values("Amount", ascending=False).head(5)
+            v_chart = alt.Chart(top_vendors).mark_bar().encode(
+                x='Amount',
+                y=alt.Y('Vendor', sort='-x'),
+                color='Vendor'
+            )
+            st.altair_chart(v_chart, use_container_width=True)
+            
+        with c4:
+            st.subheader("💎 Top 5 Expensive Items")
+            top_items = df_filtered.sort_values("Amount", ascending=False).head(5)
+            i_chart = alt.Chart(top_items).mark_bar().encode(
+                x='Amount',
+                y=alt.Y('Item', sort='-x'),
+                color='Category'
+            )
+            st.altair_chart(i_chart, use_container_width=True)
 
 with t2:
-    if not df.empty: 
-        st.dataframe(df, use_container_width=True)
+    if not df_filtered.empty: 
+        st.dataframe(df_filtered, use_container_width=True)
         
