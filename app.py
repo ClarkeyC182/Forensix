@@ -23,63 +23,70 @@ for d in DIRS.values(): d.mkdir(exist_ok=True)
 # CONSTANTS
 REQUIRED_COLS = ["Date", "Vendor", "Item", "Amount", "Currency", "IVA", "Category", "Sub_Category", "Is_Vice", "File"]
 
-# --- HELPER: SAFE DATE PARSER (Fixes the YYYY-MM-DD crash) ---
+# --- HELPER: SAFE DATE PARSER (CRITICAL FIX) ---
 def safe_parse_date(date_val):
-    """Handles garbage dates like 'YYYY-MM-DD' or 'None' safely"""
+    """
+    Catches garbage AI output like 'YYYY-MM-DD' and prevents crashes.
+    """
     try:
-        # Check for known garbage strings from AI
-        s_val = str(date_val).strip().lower()
-        if s_val in ['none', 'null', 'yyyy-mm-dd', '', 'nan']:
+        # 1. Convert to string and clean
+        s_val = str(date_val).strip()
+        
+        # 2. Blacklist known AI hallucinations
+        if s_val.lower() in ['none', 'null', 'nan', '', 'yyyy-mm-dd', 'unknown']:
             return pd.Timestamp.now()
             
-        # Try to convert
-        dt = pd.to_datetime(date_val, errors='coerce')
+        # 3. Attempt conversion
+        dt = pd.to_datetime(s_val, errors='coerce')
+        
+        # 4. If conversion failed (NaT), return Today
         if pd.isna(dt):
             return pd.Timestamp.now()
+            
         return dt
     except:
         return pd.Timestamp.now()
 
-# --- DATABASE ENGINE ---
+# --- DATABASE ENGINE (PARANOID MODE) ---
 def load_data():
     conn = st.connection("gsheets", type=GSheetsConnection)
     try:
-        # Load without cache
+        # 1. Force raw read
         df = conn.read(worksheet="Sheet1", ttl=0)
         
-        # SAFETY CHECK 1: If empty or weird, start fresh
-        if df.empty or len(df.columns) < len(REQUIRED_COLS):
+        # 2. If completely empty, return proper structure immediately
+        if df.empty or len(df.columns) < 2:
             return pd.DataFrame(columns=REQUIRED_COLS)
             
-        # SAFETY CHECK 2: Ensure every column exists in memory
+        # 3. Force Columns to Exist (Fixes KeyError: 'Amount')
         for col in REQUIRED_COLS:
             if col not in df.columns:
                 df[col] = None
                 
-        # Clean Data Types (The Anti-Crash Layer)
+        # 4. Clean & Typecast Data
         df['Amount'] = pd.to_numeric(df['Amount'], errors='coerce').fillna(0.0)
         df['IVA'] = pd.to_numeric(df['IVA'], errors='coerce').fillna(0.0)
         df['Is_Vice'] = df['Is_Vice'].fillna(False).astype(bool)
         
-        # Apply Safe Date Parsing
+        # 5. Fix Dates using the new Safe Parser
         df['Date'] = df['Date'].apply(safe_parse_date)
         
         return df[REQUIRED_COLS]
-    except Exception:
-        # Ultimate fallback
+    except:
+        # Fallback: Return empty but valid structure
         return pd.DataFrame(columns=REQUIRED_COLS)
 
 def save_data(df):
     conn = st.connection("gsheets", type=GSheetsConnection)
     df_save = df.copy()
     
-    # Final sanitize before upload
+    # Sanitize before saving
     df_save['Date'] = df_save['Date'].apply(safe_parse_date).dt.strftime('%Y-%m-%d')
     df_save['Amount'] = pd.to_numeric(df_save['Amount'], errors='coerce').fillna(0.0)
     df_save['IVA'] = pd.to_numeric(df_save['IVA'], errors='coerce').fillna(0.0)
     df_save['Is_Vice'] = df_save['Is_Vice'].fillna(False).astype(bool)
     
-    # Clean text
+    # Clean text columns
     for c in ['Vendor', 'Item', 'Currency', 'Category', 'Sub_Category', 'File']:
         if c in df_save.columns:
             df_save[c] = df_save[c].astype(str).replace('nan', '').replace('None', '')
@@ -159,13 +166,15 @@ def vision_slice_micro(image_path):
     return slices
 
 def analyze_chunk(content_bytes, mime_type, client, user_vices, home_currency):
+    # UPDATED PROMPT: Explicitly forbids placeholders
     prompt = f"""
     Role: Forensic Auditor. Extract items.
     JSON Format: [{{ "d": "YYYY-MM-DD", "v": "Vendor", "n": "Item", "p": 1.00, "c": "£", "mc": "Category", "sc": "Sub", "vice": false }}]
     Rules: 
-    1. Currency default {home_currency}. 
-    2. Vice keywords: {user_vices}.
-    3. Return ONLY valid JSON array.
+    1. Look for date. If NOT found, use null. DO NOT use 'YYYY-MM-DD' or 'Unknown'.
+    2. Currency default {home_currency}. 
+    3. Vice keywords: {user_vices}.
+    4. Return ONLY valid JSON array.
     """
     try:
         res = client.models.generate_content(
@@ -220,7 +229,7 @@ def process_upload(uploaded_file, api_key, user_vices, home_currency):
 api_key = get_api_key()
 if not api_key: st.stop()
 
-# 1. LOAD DATA (DEFENSIVE MODE)
+# 1. LOAD DATA (PARANOID MODE)
 df = load_data()
 
 # 2. SIDEBAR
@@ -253,29 +262,25 @@ with st.sidebar:
     goal_target = st.number_input("Target Amount", 150.0)
     user_vices = st.text_area("Vices", "alcohol, candy, betting, tobacco")
     
+    if st.button("⚠️ Force Clear DB"):
+        try:
+            conn = st.connection("gsheets", type=GSheetsConnection)
+            empty = pd.DataFrame(columns=REQUIRED_COLS)
+            conn.update(worksheet="Sheet1", data=empty)
+            st.cache_data.clear()
+            st.rerun()
+        except: st.error("Clear failed. Check permissions.")
+        
     if not df.empty:
         st.write("### 📥 Export")
         st.download_button("📊 CSV", df.to_csv(index=False), "data.csv", "text/csv")
         pdf_data = generate_pdf_safe(df, goal_name, home_curr)
         if pdf_data: st.download_button("📄 PDF", pdf_data, "report.pdf", "application/pdf")
 
-    # DB CLEAR BUTTON
-    if st.button("⚠️ Force Clear DB"):
-        try:
-            conn = st.connection("gsheets", type=GSheetsConnection)
-            # Create fresh DF with ALL required cols
-            empty = pd.DataFrame(columns=REQUIRED_COLS)
-            conn.update(worksheet="Sheet1", data=empty)
-            st.cache_data.clear()
-            st.success("Database Reset!")
-            time.sleep(1)
-            st.rerun()
-        except: st.error("Failed to clear. Check Sheets permissions.")
-
 # 3. DASHBOARD
 st.title(f"🎯 Project: {goal_name}")
 
-# KPIS
+# Metrics
 col1, col2, col3, col4 = st.columns(4)
 spent = df['Amount'].sum()
 vice_spend = df[df['Is_Vice']]['Amount'].sum()
@@ -297,14 +302,14 @@ if uploaded and st.button("🔍 Run Forensic Audit"):
     for idx, file in enumerate(uploaded):
         new_data = process_upload(file, api_key, user_vices, home_curr)
         if not new_data.empty:
-            # Auto-Fill Logic (Vendor / Date)
+            # Auto-Fill Logic
             new_data['Vendor'] = new_data['Vendor'].replace([None, 'null'], np.nan).ffill().bfill().fillna("Unknown")
             
-            # Apply safe date parser
+            # SAFE DATE PARSING (Crucial step)
             new_data['Date'] = new_data['Date'].apply(safe_parse_date)
             new_data['Currency'] = new_data['Currency'].fillna(home_curr)
             
-            # Auto-VAT Logic
+            # Auto-VAT
             def calc_iva(row):
                 rate = 20.0 if "UK" in residency else 21.0
                 if "grocery" in str(row['Category']).lower(): rate = 0.0 if "UK" in residency else 4.0
@@ -316,6 +321,8 @@ if uploaded and st.button("🔍 Run Forensic Audit"):
             
     if all_new_rows:
         combined_new = pd.concat(all_new_rows, ignore_index=True)
+        # Convert to date object for the UI editor
+        combined_new['Date'] = combined_new['Date'].dt.date
         st.session_state.review_data = combined_new
         st.rerun()
 
@@ -325,6 +332,9 @@ if 'review_data' in st.session_state and st.session_state.review_data is not Non
     st.subheader("🧐 Review & Edit Results")
     st.info("Edit data below to correct any AI mistakes. Click Confirm to save.")
     
+    # Force convert to Date only (no time) for cleaner editing
+    st.session_state.review_data['Date'] = pd.to_datetime(st.session_state.review_data['Date']).dt.date
+
     edited_df = st.data_editor(
         st.session_state.review_data,
         num_rows="dynamic",
@@ -358,3 +368,4 @@ with tab1:
 with t2:
     if not df.empty:
         st.dataframe(df, use_container_width=True)
+        
