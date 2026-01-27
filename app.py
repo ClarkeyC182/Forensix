@@ -33,11 +33,26 @@ def safe_float(val):
     except: return 0.0
 
 def safe_date(val):
+    """
+    Robust date parser. 
+    1. Tries standard formats.
+    2. Clamps future dates to Today (prevents 2026 hallucinations).
+    3. Clamps old dates to 2020 (prevents 1900 errors).
+    """
     try:
         s = str(val).strip().lower()
         if s in ['none', 'null', 'nan', '', 'yyyy-mm-dd', 'unknown']: return pd.Timestamp.now()
+        
         dt = pd.to_datetime(val, errors='coerce', dayfirst=True)
-        return pd.Timestamp.now() if pd.isna(dt) else dt
+        
+        if pd.isna(dt): return pd.Timestamp.now()
+        
+        # SANITY CLAMP: Ignore dates too far in future/past
+        now = pd.Timestamp.now()
+        if dt > now + pd.Timedelta(days=365): return now # Cap at 1 year future
+        if dt.year < 2020: return now # Cap at 2020
+        
+        return dt
     except: return pd.Timestamp.now()
 
 # --- DATABASE ENGINE ---
@@ -118,7 +133,7 @@ def vision_slice_micro(image_path):
     img = cv2.imread(str(image_path))
     if img is None: return []
     h, w = img.shape[:2]
-    if h < 2000: return [img] # Threshold lowered to trigger slicing more often
+    if h < 2000: return [img]
     
     slices = []
     start = 0
@@ -131,6 +146,7 @@ def vision_slice_micro(image_path):
     return slices
 
 def analyze_chunk(content_bytes, mime_type, client, user_vices, home_currency):
+    # AGGRESSIVE SCAN PROMPT
     prompt = f"""
     Role: Forensic Auditor.
     Task: Extract lines from this receipt slice.
@@ -138,12 +154,13 @@ def analyze_chunk(content_bytes, mime_type, client, user_vices, home_currency):
     JSON: [{{ "d": "YYYY-MM-DD", "v": "Vendor", "n": "Item Name", "p": 1.00, "c": "£", "mc": "Category", "sc": "Sub", "vice": false }}]
     
     RULES:
-    1. **NO TOTALS:** Ignore 'Total', 'Subtotal', 'Balance', 'Change'.
-    2. **VENDOR:** Header of specific receipt or 'CONT'.
-    3. **CATEGORY (mc):** [Groceries, Alcohol, Dining, Transport, Shopping, Utilities, Services].
-    4. **SUB-CATEGORY (sc):** Specifics (e.g. Dairy, Meat, Fuel, Clothes).
-    5. **VICES:** {user_vices}.
-    6. **CURRENCY:** Default {home_currency}. 
+    1. **SCAN ALL:** Do not stop at the first receipt. Scan left-to-right, top-to-bottom. Extract EVERYTHING.
+    2. **NO TOTALS:** Ignore 'Total', 'Subtotal', 'Balance', 'Change'.
+    3. **VENDOR:** Header of specific receipt or 'CONT'.
+    4. **CATEGORY (mc):** [Groceries, Alcohol, Dining, Transport, Shopping, Utilities, Services].
+    5. **SUB-CATEGORY (sc):** Specifics (e.g. Dairy, Meat, Fuel, Clothes).
+    6. **VICES:** {user_vices}.
+    7. **CURRENCY:** Default {home_currency}. 
     """
     try:
         res = client.models.generate_content(
@@ -165,7 +182,6 @@ def process_upload(uploaded_file, api_key, user_vices, home_currency):
     
     with open(temp_path, "wb") as f: f.write(uploaded_file.getbuffer())
     
-    # 1. AGGRESSIVE RESIZE (Fixes 20MB issue)
     if uploaded_file.type != "application/pdf":
         resize_image_force(temp_path)
         
@@ -177,7 +193,6 @@ def process_upload(uploaded_file, api_key, user_vices, home_currency):
             with open(temp_path, "rb") as f:
                 raw_items.extend(analyze_chunk(f.read(), "application/pdf", client, user_vices, home_currency))
         else:
-            # 2. SLICING IS ACTIVE (Fixes blurry text)
             slices = vision_slice_micro(temp_path)
             bar = st.progress(0)
             for i, s in enumerate(slices):
@@ -209,18 +224,15 @@ def process_upload(uploaded_file, api_key, user_vices, home_currency):
             last_known_vendor = raw_vendor
             
         vendor = last_known_vendor.upper()
-        if "SPAN" in vendor: vendor = "SPAR"
-        if "MERCAD" in vendor: vendor = "MERCADONA"
-        if "LID" in vendor: vendor = "LIDL"
-        if "ALE" in vendor and "HOP" in vendor: vendor = "ALE-HOP"
+        # Removed hardcoded Spain-specific logic to keep it general
         
         cat = str(i.get("mc", "Unknown"))
         sub_cat = str(i.get("sc", "General"))
         is_vice = bool(i.get("vice", False))
         
         if cat in ["Unknown", "Shopping", "None"]:
-            if vendor in ["MERCADONA", "LIDL", "SPAR", "TESCO", "ALDI"]: cat = "Groceries"
-            elif vendor in ["ALE-HOP", "AMAZON"]: cat = "Shopping"
+            if "MERCADONA" in vendor or "LIDL" in vendor or "TESCO" in vendor: cat = "Groceries"
+            elif "AMAZON" in vendor: cat = "Shopping"
 
         vice_keywords = ["chocolate", "candy", "betting", "tobacco", "cigar", "wine", "beer", "cerveza", "vino", "vodka", "ron", "gin"]
         if any(v in name_lower for v in vice_keywords):
@@ -298,11 +310,22 @@ with st.sidebar:
     # --- INTERACTIVE FILTERS ---
     st.divider()
     st.subheader("🔍 Filters")
-    min_date = df['Date'].min().date() if not df.empty else datetime.now().date()
-    max_date = df['Date'].max().date() if not df.empty else datetime.now().date()
-    if min_date == max_date: min_date = min_date - pd.Timedelta(days=1)
     
-    date_range = st.slider("Date Range", min_value=min_date, max_value=max_date, value=(min_date, max_date))
+    # Safe Min/Max Date Logic
+    if not df.empty:
+        df['Date'] = pd.to_datetime(df['Date'])
+        min_dt = df['Date'].min().date()
+        max_dt = df['Date'].max().date()
+    else:
+        min_dt = datetime.now().date()
+        max_dt = datetime.now().date()
+        
+    if min_dt == max_dt:
+        min_dt = min_dt - pd.Timedelta(days=1)
+    
+    # Range Slider
+    date_range = st.slider("Date Range", min_value=min_dt, max_value=max_dt, value=(min_dt, max_dt))
+    
     all_cats = list(df['Category'].unique()) if not df.empty else []
     selected_cats = st.multiselect("Category", all_cats, default=all_cats)
     
@@ -383,79 +406,48 @@ if 'review_data' in st.session_state and st.session_state.review_data is not Non
     if st.button("❌ Discard"):
         st.session_state.review_data = None; st.rerun()
 
-# 7. ANALYTICS (RESTORED TIMELINE)
+# 7. ANALYTICS
 t1, t2 = st.tabs(["📊 Executive View", "📝 Data Ledger"])
 with t1:
     if not df_filtered.empty:
         c1, c2 = st.columns(2)
-        
-        # CHART 1: Drill-Down Logic
         with c1:
             if len(selected_cats) == 1:
                 cat_name = selected_cats[0]
                 st.subheader(f"🔬 Breakdown: {cat_name}")
                 chart = alt.Chart(df_filtered).mark_bar().encode(
-                    x=alt.X('Sub_Category', sort='-y'),
-                    y='Amount',
-                    color='Sub_Category',
-                    tooltip=['Item', 'Amount']
+                    x=alt.X('Sub_Category', sort='-y'), y='Amount', color='Sub_Category', tooltip=['Item', 'Amount']
                 ).interactive()
             else:
                 st.subheader("💸 Spending by Category")
                 chart = alt.Chart(df_filtered).mark_bar().encode(
-                    x=alt.X('Category', sort='-y'),
-                    y='Amount',
-                    color='Category',
-                    tooltip=['Category', 'Amount']
+                    x=alt.X('Category', sort='-y'), y='Amount', color='Category', tooltip=['Category', 'Amount']
                 ).interactive()
             st.altair_chart(chart, use_container_width=True)
             
-        # CHART 2: Vice Meter
         with c2:
             st.subheader("😈 Vice Meter")
             base = alt.Chart(df_filtered).encode(theta=alt.Theta("Amount", stack=True))
-            pie = base.mark_arc(outerRadius=120).encode(
-                color=alt.Color("Is_Vice"),
-                order=alt.Order("Amount", sort="descending"),
-                tooltip=["Is_Vice", "Amount"]
-            )
-            text = base.mark_text(radius=140).encode(
-                text=alt.Text("Amount", format=".1f"),
-                order=alt.Order("Amount", sort="descending"),
-                color=alt.value("black") 
-            )
+            pie = base.mark_arc(outerRadius=120).encode(color=alt.Color("Is_Vice"), order=alt.Order("Amount", sort="descending"), tooltip=["Is_Vice", "Amount"])
+            text = base.mark_text(radius=140).encode(text=alt.Text("Amount", format=".1f"), order=alt.Order("Amount", sort="descending"), color=alt.value("black"))
             st.altair_chart(pie + text, use_container_width=True)
             
-        # CHART 3: Financial Heartbeat (RESTORED!)
         st.subheader("📈 Financial Heartbeat (Timeline)")
-        # Area chart for "Sexy" look + Line for clarity
         base_line = alt.Chart(df_filtered).encode(x='Date')
-        area = base_line.mark_area(opacity=0.3).encode(
-            y='sum(Amount)',
-            color='Category'
-        )
-        line = base_line.mark_line().encode(
-            y='sum(Amount)',
-            color='Category',
-            tooltip=['Date', 'Category', 'sum(Amount)']
-        )
+        area = base_line.mark_area(opacity=0.3).encode(y='sum(Amount)', color='Category')
+        line = base_line.mark_line().encode(y='sum(Amount)', color='Category', tooltip=['Date', 'Category', 'sum(Amount)'])
         st.altair_chart((area + line).interactive(), use_container_width=True)
             
-        # CHART 4 & 5: Leaders
         c3, c4 = st.columns(2)
         with c3:
             st.subheader("🏆 Top Vendors")
             top_vendors = df_filtered.groupby("Vendor")['Amount'].sum().reset_index().sort_values("Amount", ascending=False).head(5)
-            v_chart = alt.Chart(top_vendors).mark_bar().encode(
-                x='Amount', y=alt.Y('Vendor', sort='-x'), color='Vendor'
-            )
+            v_chart = alt.Chart(top_vendors).mark_bar().encode(x='Amount', y=alt.Y('Vendor', sort='-x'), color='Vendor')
             st.altair_chart(v_chart, use_container_width=True)
         with c4:
             st.subheader("💎 Top Items")
             top_items = df_filtered.sort_values("Amount", ascending=False).head(5)
-            i_chart = alt.Chart(top_items).mark_bar().encode(
-                x='Amount', y=alt.Y('Item', sort='-x'), color='Category'
-            )
+            i_chart = alt.Chart(top_items).mark_bar().encode(x='Amount', y=alt.Y('Item', sort='-x'), color='Category')
             st.altair_chart(i_chart, use_container_width=True)
 
 with t2:
