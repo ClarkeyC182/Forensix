@@ -102,43 +102,40 @@ def get_api_key():
     if "GEMINI_API_KEY" in st.secrets: return st.secrets["GEMINI_API_KEY"]
     return ""
 
-def compress_image(image_path):
-    """
-    CONVERTS ANY IMAGE (PNG/JPG) to a standardized, compressed JPEG.
-    Fixes the '20MB PNG' issue by shrinking it to < 3MB without text loss.
-    """
-    try:
-        with Image.open(image_path) as img:
-            # Convert to RGB (Strip Alpha channel from PNGs)
-            if img.mode in ("RGBA", "P"):
-                img = img.convert("RGB")
-            
-            # Max dimension 4096 (Safe for Gemini Vision)
-            if img.width > 4096 or img.height > 4096:
-                img.thumbnail((4096, 4096), Image.Resampling.LANCZOS)
-            
-            # Save as JPEG with 70 quality (Visually identical for text, 90% smaller filesize)
-            img.save(image_path, format="JPEG", quality=70)
-            return True
-    except: return False
+def vision_slice_micro(image_path):
+    """Slices huge images into overlapping chunks to maintain OCR clarity."""
+    img = cv2.imread(str(image_path))
+    if img is None: return []
+    h, w = img.shape[:2]
+    
+    # If image is small-ish (under 2500px tall), just send it whole
+    if h < 2500: return [img]
+    
+    slices = []
+    start = 0
+    # Create overlapping slices (1500px tall, 300px overlap)
+    while start < h:
+        end = min(start + 1500, h)
+        if (end - start) < 200 and len(slices) > 0: break 
+        slices.append(img[start:end, :])
+        if end == h: break
+        start += 1200 
+    return slices
 
-def analyze_full_image(content_bytes, mime_type, client, user_vices, home_currency):
-    # CATEGORY-AWARE PROMPT
+def analyze_chunk(content_bytes, mime_type, client, user_vices, home_currency):
+    # HYBRID PROMPT: Handles both Context & Content
     prompt = f"""
-    Role: Senior OCR Specialist.
-    Context: Collage of receipts. Extract EVERY line item.
+    Role: Forensic Auditor.
+    Task: Extract lines from this receipt slice.
     
     JSON: [{{ "d": "YYYY-MM-DD", "v": "Vendor", "n": "Item Name", "p": 1.00, "c": "£", "mc": "Category", "sc": "Sub", "vice": false }}]
     
     RULES:
     1. **NO TOTALS:** Ignore 'Total', 'Subtotal', 'Balance', 'Change'.
-    2. **ITEM NAME:** Product name only. No prices in name.
-    3. **CATEGORY (mc):** Choose from: [Groceries, Alcohol, Dining, Transport, Shopping, Utilities, Services].
-    4. **VICE CHECK:** If item is alcohol, candy, tobacco, gambling -> vice = true.
-    5. **VENDOR:** Header of the specific receipt.
-    6. **DATE:** Date of the specific receipt.
-    7. **CURRENCY:** Default {home_currency}. 
-    8. **USER VICES:** {user_vices}.
+    2. **VENDOR LOGIC:** If you see a logo/header, output the Vendor Name. If this is the middle of a long list and NO header is visible, output 'CONT' (for Continuation).
+    3. **CATEGORY:** [Groceries, Alcohol, Dining, Transport, Shopping, Utilities, Services].
+    4. **VICES:** {user_vices}.
+    5. **CURRENCY:** Default {home_currency}. 
     """
     try:
         res = client.models.generate_content(
@@ -160,24 +157,28 @@ def process_upload(uploaded_file, api_key, user_vices, home_currency):
     
     with open(temp_path, "wb") as f: f.write(uploaded_file.getbuffer())
     
-    # MIME TYPE SWITCHER
-    if uploaded_file.type == "application/pdf":
-        mime_type = "application/pdf"
-    else:
-        # Force Compress & Convert to JPEG
-        compress_image(temp_path)
-        mime_type = "image/jpeg"
-        
     client = genai.Client(api_key=api_key)
     raw_items = []
     
     try:
-        with open(temp_path, "rb") as f:
-            raw_items.extend(analyze_full_image(f.read(), mime_type, client, user_vices, home_currency))
+        if uploaded_file.type == "application/pdf":
+            with open(temp_path, "rb") as f:
+                raw_items.extend(analyze_chunk(f.read(), "application/pdf", client, user_vices, home_currency))
+        else:
+            # RESTORED SLICING for large images
+            slices = vision_slice_micro(temp_path)
+            bar = st.progress(0)
+            for i, s in enumerate(slices):
+                _, buf = cv2.imencode(".jpg", s)
+                raw_items.extend(analyze_chunk(buf.tobytes(), "image/jpeg", client, user_vices, home_currency))
+                bar.progress((i + 1) / len(slices))
+            time.sleep(0.2); bar.empty()
     finally:
         if os.path.exists(temp_path): os.remove(temp_path)
     
     extracted = []
+    last_known_vendor = "Unknown" # Tracking variable for slices
+
     for i in raw_items:
         # 1. Total Filter
         name = str(i.get("n", "")).strip()
@@ -193,40 +194,37 @@ def process_upload(uploaded_file, api_key, user_vices, home_currency):
                 name = "Unidentified Item"
             except: pass
 
-        # 3. Typo Fixer
-        vendor = str(i.get("v", "Unknown")).upper()
+        # 3. VENDOR STITCHING
+        # If AI says 'CONT' or 'Unknown', use the last good vendor we saw.
+        # If AI finds a NEW vendor (e.g. 'Spar'), update our tracker.
+        raw_vendor = str(i.get("v", "Unknown"))
+        if raw_vendor.upper() not in ["UNKNOWN", "CONT", "NONE", "NULL"]:
+            last_known_vendor = raw_vendor # We found a new header!
+            
+        # 4. Typo Fixer (Applied to the 'stitched' vendor)
+        vendor = last_known_vendor.upper()
         if "SPAN" in vendor: vendor = "SPAR"
         if "MERCAD" in vendor: vendor = "MERCADONA"
         if "LID" in vendor: vendor = "LIDL"
         if "ALE" in vendor and "HOP" in vendor: vendor = "ALE-HOP"
         
-        # 4. SMART CATEGORIZER
+        # 5. Smart Categories
         cat = str(i.get("mc", "Unknown"))
         is_vice = bool(i.get("vice", False))
         
-        # CATEGORY SANITY CHECK: Don't label scourers as Alcohol
-        alcohol_keywords = ["wine", "beer", "cerveza", "vino", "vodka", "ron", "gin", "whisky", "licor"]
-        if cat == "Alcohol" and not any(k in name_lower for k in alcohol_keywords):
-            cat = "Groceries" # Revert false positive alcohol
-            is_vice = False
-
-        # Force Obvious Categories
+        # Fix category misses
         if cat in ["Unknown", "Shopping", "None"]:
-            if vendor in ["MERCADONA", "LIDL", "SPAR", "TESCO", "ALDI"]:
-                cat = "Groceries"
-            elif vendor in ["ALE-HOP", "AMAZON"]:
-                cat = "Shopping"
+            if vendor in ["MERCADONA", "LIDL", "SPAR", "TESCO", "ALDI"]: cat = "Groceries"
+            elif vendor in ["ALE-HOP", "AMAZON"]: cat = "Shopping"
 
         # Force Vices
-        vice_keywords = ["chocolate", "candy", "betting", "tobacco", "cigar"] + alcohol_keywords
+        vice_keywords = ["chocolate", "candy", "betting", "tobacco", "cigar", "wine", "beer", "cerveza", "vino", "vodka", "ron", "gin"]
         if any(v in name_lower for v in vice_keywords):
             is_vice = True
-            if any(k in name_lower for k in alcohol_keywords):
-                cat = "Alcohol"
-            elif "chocolate" in name_lower or "candy" in name_lower:
-                cat = "Groceries"
+            if any(k in name_lower for k in ["wine", "beer", "cerveza", "vino", "vodka", "ron"]): cat = "Alcohol"
+            elif "chocolate" in name_lower or "candy" in name_lower: cat = "Groceries"
 
-        # 5. Lemon Filter
+        # 6. Lemon Filter
         if price > 100 and cat in ["Groceries", "Dining", "Alcohol"]: price = price / 100.0
 
         extracted.append({
