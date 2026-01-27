@@ -20,11 +20,14 @@ BASE_DIR = Path(__file__).parent.absolute()
 DIRS = { "TEMP": BASE_DIR / "temp_uploads" }
 for d in DIRS.values(): d.mkdir(exist_ok=True)
 
+# --- SESSION STATE (The "Holding Bay") ---
+if 'review_data' not in st.session_state:
+    st.session_state.review_data = None
+
 # --- DATABASE ---
 def load_data():
     conn = st.connection("gsheets", type=GSheetsConnection)
     try:
-        # Now reading 10 columns (added Currency)
         df = conn.read(worksheet="Sheet1", usecols=list(range(10)), ttl=5)
         df = df.dropna(how="all")
         df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
@@ -38,12 +41,43 @@ def save_data(df):
         df_save['Date'] = df_save['Date'].dt.strftime('%Y-%m-%d')
     conn.update(worksheet="Sheet1", data=df_save)
 
-# --- AUTH ---
+# --- TAX LOGIC ---
+def calculate_net_monthly(gross_annual, country):
+    # Simplified Effective Tax Rate Estimator (2025/26 Rules approx)
+    if country == "UK (GBP)":
+        # Rough UK Estimate (Tax + NI)
+        if gross_annual < 12570: net = gross_annual
+        elif gross_annual < 50000: net = gross_annual * 0.82 # ~18% eff deduction
+        else: net = gross_annual * 0.72 # Higher bracket avg
+    elif country == "Spain (EUR)":
+        # Rough Spain Estimate (IRPF + Social Security)
+        if gross_annual < 12450: net = gross_annual * 0.94
+        elif gross_annual < 20200: net = gross_annual * 0.85
+        elif gross_annual < 35200: net = gross_annual * 0.81
+        elif gross_annual < 60000: net = gross_annual * 0.75
+        else: net = gross_annual * 0.70
+    else:
+        net = gross_annual * 0.80 # General Fallback
+    
+    return net / 12
+
+def get_vat_rate(country, category):
+    # Auto-VAT based on location
+    cat = str(category).lower()
+    if country == "UK (GBP)":
+        if "grocery" in cat or "food" in cat: return 0.0 # Zero rated food
+        return 20.0 # Standard
+    elif country == "Spain (EUR)":
+        if "grocery" in cat or "bread" in cat: return 4.0 # Super reduced
+        if "dining" in cat or "restaurant" in cat: return 10.0 # Reduced
+        return 21.0 # Standard
+    return 0.0
+
+# --- ENGINE ---
 def get_api_key():
     if "GEMINI_API_KEY" in st.secrets: return st.secrets["GEMINI_API_KEY"]
     return ""
 
-# --- ENGINE ---
 def vision_slice_micro(image_path):
     img = cv2.imread(str(image_path))
     if img is None: return []
@@ -60,19 +94,15 @@ def vision_slice_micro(image_path):
     return slices
 
 def analyze_content(content_bytes, mime_type, client, user_vices, home_currency):
-    # UPDATED PROMPT: Extracts Currency Symbol (c)
     prompt = f"""
     Role: Forensic Auditor. Extract items, DATE, and CURRENCY.
     Context: Image may contain multiple receipts.
     Output keys: d=date(YYYY-MM-DD), v=vendor, n=name, p=price, c=currency_symbol, mc=cat, sc=sub, vice=bool.
-    
     Rules:
     1. Look for date. If null, use null.
     2. Look for currency (£, €, $). If missing, assume {home_currency}.
     3. Main Cat: [Groceries, Dining, Alcohol, Transport, Shopping, Utils, Services].
     4. Vice: {user_vices}
-    
-    JSON: {{ "items": [ {{ "d": "2024-05-20", "v": "Tesco", "n": "Milk", "p": 1.20, "c": "£", "mc": "Groceries", "sc": "Dairy", "vice": false }} ] }}
     """
     try:
         res = client.models.generate_content(
@@ -82,7 +112,6 @@ def analyze_content(content_bytes, mime_type, client, user_vices, home_currency)
         )
         data = json.loads(res.text)
         items = data.get("items", []) if isinstance(data, dict) else []
-        
         clean_items = []
         for i in items:
             clean_items.append({
@@ -90,7 +119,7 @@ def analyze_content(content_bytes, mime_type, client, user_vices, home_currency)
                 "Vendor": i.get("v", "Unknown"),
                 "Item": i.get("n", "Item"),
                 "Amount": i.get("p", 0.0),
-                "Currency": i.get("c", home_currency), # Save the extracted currency
+                "Currency": i.get("c", home_currency),
                 "Category": i.get("mc", "Shopping"),
                 "Sub_Category": i.get("sc", "General"),
                 "Is_Vice": i.get("vice", False)
@@ -102,7 +131,6 @@ def process_upload(uploaded_file, api_key, user_vices, home_currency):
     temp_path = DIRS['TEMP'] / uploaded_file.name
     with open(temp_path, "wb") as f: f.write(uploaded_file.getbuffer())
     client = genai.Client(api_key=api_key)
-    
     extracted_items = []
     if uploaded_file.type == "application/pdf":
         with open(temp_path, "rb") as f: extracted_items.extend(analyze_content(f.read(), "application/pdf", client, user_vices, home_currency))
@@ -116,31 +144,20 @@ def process_upload(uploaded_file, api_key, user_vices, home_currency):
         time.sleep(0.2); bar.empty()
     os.remove(temp_path)
     
-    # --- INTELLIGENT FILL V4 (Date + Vendor + Currency) ---
     if extracted_items:
         df_temp = pd.DataFrame(extracted_items)
-        
-        # 1. Vendor Fill
         if 'Vendor' in df_temp.columns:
             df_temp['Vendor'] = df_temp['Vendor'].replace(["Unknown", "unknown", "null", None], np.nan)
             df_temp['Vendor'] = df_temp['Vendor'].ffill().bfill().fillna("Unknown")
-            
-        # 2. Date Fill
         if 'Date' in df_temp.columns:
             df_temp['Date'] = pd.to_datetime(df_temp['Date'], errors='coerce')
-            df_temp['Date'] = df_temp['Date'].ffill().bfill()
-            df_temp['Date'] = df_temp['Date'].fillna(pd.Timestamp.now())
-
-        # 3. Currency Fill
+            df_temp['Date'] = df_temp['Date'].ffill().bfill().fillna(pd.Timestamp.now())
         if 'Currency' in df_temp.columns:
              df_temp['Currency'] = df_temp['Currency'].replace([None, ""], np.nan)
              df_temp['Currency'] = df_temp['Currency'].ffill().bfill().fillna(home_currency)
-            
         for col in ["IVA", "File"]: 
             if col not in df_temp.columns: df_temp[col] = ""
-            
         return df_temp.to_dict('records')
-            
     return extracted_items
 
 def generate_pdf_safe(df, goal_name, currency_symbol):
@@ -176,31 +193,33 @@ with st.sidebar:
     st.title("👤 Profile")
     st.success("☁️ Database Connected")
     
-    # 1. CURRENCY SETTING
-    currency_options = ["£", "€", "$"]
-    home_currency = st.selectbox("Home Currency", currency_options, index=0)
+    # 1. TAX & CURRENCY SETTINGS
+    st.markdown("### 🌍 Residency")
+    residency = st.selectbox("Tax Residency", ["UK (GBP)", "Spain (EUR)"], index=1) # Default Spain based on user context
+    home_currency = "£" if "UK" in residency else "€"
     
-    # 2. INCOME CALCULATOR
-    st.markdown("### 💰 Budget Settings")
+    # 2. NET INCOME CALCULATOR
+    st.markdown("### 💰 Income (Auto-Tax)")
     col_inc1, col_inc2 = st.columns(2)
-    income_freq = col_inc1.selectbox("Income Type", ["Yearly", "Monthly", "Weekly", "Hourly"])
-    income_amount = col_inc2.number_input("Amount", value=30000.0)
+    income_freq = col_inc1.selectbox("Freq", ["Yearly", "Monthly", "Hourly"])
+    gross_income = col_inc2.number_input("Gross Amount", value=35000.0, step=1000.0)
     
-    # Normalize to Monthly
-    monthly_budget = 0.0
-    if income_freq == "Yearly": monthly_budget = income_amount / 12
-    elif income_freq == "Monthly": monthly_budget = income_amount
-    elif income_freq == "Weekly": monthly_budget = income_amount * 4.33
-    elif income_freq == "Hourly": monthly_budget = income_amount * 160 # Approx 40hr week
+    # Calculate Net Monthly
+    gross_annual = 0.0
+    if income_freq == "Yearly": gross_annual = gross_income
+    elif income_freq == "Monthly": gross_annual = gross_income * 12
+    elif income_freq == "Hourly": gross_annual = gross_income * 160 * 12
     
-    st.caption(f"Calculated Monthly Budget: {home_currency}{monthly_budget:,.2f}")
+    net_monthly = calculate_net_monthly(gross_annual, residency)
     
+    st.metric("Est. Net Monthly", f"{home_currency}{net_monthly:,.2f}", help="Estimated after Tax/NI/Social Security")
+
     # 3. DATE FILTER
+    st.markdown("---")
     st.markdown("### 📅 Time Travel")
     if not df.empty:
         df['Date'] = pd.to_datetime(df['Date'])
         months = df['Date'].dt.to_period('M').unique().sort_values(ascending=False)
-        # Convert period to string for selectbox
         month_strs = [str(m) for m in months]
         selected_month_str = st.selectbox("Select Month", month_strs) if month_strs else None
         
@@ -220,9 +239,9 @@ with st.sidebar:
     if not df.empty:
         st.write("## 📥 Export")
         csv_data = filtered_df.to_csv(index=False).encode('utf-8')
-        st.download_button("📊 Download CSV (Month)", csv_data, "data.csv", "text/csv")
+        st.download_button("📊 CSV", csv_data, "data.csv", "text/csv")
         pdf_data = generate_pdf_safe(filtered_df, goal_name, home_currency)
-        if pdf_data: st.download_button("📄 Download PDF (Month)", pdf_data, "report.pdf", "application/pdf")
+        if pdf_data: st.download_button("📄 PDF", pdf_data, "report.pdf", "application/pdf")
     
     if st.button("⚠️ Clear Database"):
         empty_df = pd.DataFrame(columns=required_cols)
@@ -236,9 +255,9 @@ col1, col2, col3, col4 = st.columns(4)
 month_spend = filtered_df['Amount'].sum()
 month_tax = filtered_df['IVA'].sum()
 month_vice = filtered_df[filtered_df['Is_Vice']==True]['Amount'].sum()
-remaining = monthly_budget - month_spend
+remaining = net_monthly - month_spend
 
-col1.metric("Spent (Month)", f"{home_currency}{month_spend:.2f}", delta=f"Left: {home_currency}{remaining:.2f}")
+col1.metric("Spent (Month)", f"{home_currency}{month_spend:.2f}", delta=f"Left: {home_currency}{remaining:,.2f}")
 col2.metric("Tax Recovered", f"{home_currency}{month_tax:.2f}")
 col3.metric("Habit Leakage", f"{home_currency}{month_vice:.2f}", delta="-Leakage")
 progress = min((filtered_df[filtered_df['Is_Vice']==True]['Amount'].sum() / goal_target) * 100, 100)
@@ -255,10 +274,9 @@ if uploaded and st.button("🔍 Run Forensic Audit"):
                 try: price = float(item.get('Amount', 0))
                 except: price = 0.0
                 
-                iva_rate = 0
-                cat = item.get('Category', 'Shopping')
-                if "alcohol" in str(cat).lower(): iva_rate = 21.0
-                iva = round(price - (price / (1 + (iva_rate / 100))), 2)
+                # Smart VAT Calculation based on Residency
+                vat_rate = get_vat_rate(residency, item.get('Category', ''))
+                iva = round(price - (price / (1 + (vat_rate / 100))), 2)
                 
                 try: r_date = pd.to_datetime(item.get('Date')).strftime('%Y-%m-%d')
                 except: r_date = pd.Timestamp.now().strftime('%Y-%m-%d')
@@ -270,25 +288,48 @@ if uploaded and st.button("🔍 Run Forensic Audit"):
                     "Amount": price,
                     "Currency": item.get('Currency', home_currency),
                     "IVA": iva,
-                    "Category": cat, 
+                    "Category": item.get('Category', 'Shopping'),
                     "Sub_Category": item.get('Sub_Category', 'General'),
                     "Is_Vice": item.get('Is_Vice', False), 
                     "File": f.name
                 })
     
     if new_rows:
-        df_new = pd.DataFrame(new_rows)
-        st.write("### 🧐 Review & Edit Results")
-        st.info("Check Dates and Currencies before saving.")
-        edited_new_df = st.data_editor(df_new, num_rows="dynamic", use_container_width=True)
-        
-        if st.button("✅ Confirm & Save"):
-            updated_df = pd.concat([df, edited_new_df], ignore_index=True)
-            save_data(updated_df)
-            st.success(f"Saved {len(edited_new_df)} items!")
-            time.sleep(1)
-            st.rerun()
+        # STORE IN SESSION STATE TO PREVENT DATA LOSS
+        st.session_state.review_data = pd.DataFrame(new_rows)
+        st.rerun()
 
+# --- THE STICKY REVIEW ROOM ---
+if st.session_state.review_data is not None:
+    st.write("### 🧐 Review & Edit Results")
+    st.info("Data is held here safely. Edit below, then click Confirm to save.")
+    
+    # ADVANCED EDITOR: Dropdowns for Currency and Categories
+    edited_new_df = st.data_editor(
+        st.session_state.review_data, 
+        num_rows="dynamic", 
+        use_container_width=True,
+        column_config={
+            "Currency": st.column_config.SelectboxColumn("Currency", options=["£", "€", "$"]),
+            "Category": st.column_config.SelectboxColumn("Category", options=["Groceries", "Dining", "Alcohol", "Transport", "Shopping", "Utils", "Services"]),
+            "Is_Vice": st.column_config.CheckboxColumn("Vice?", default=False)
+        }
+    )
+    
+    col_save, col_discard = st.columns([1,4])
+    if col_save.button("✅ Confirm & Save"):
+        updated_df = pd.concat([df, edited_new_df], ignore_index=True)
+        save_data(updated_df)
+        st.session_state.review_data = None # Clear holding bay
+        st.success(f"Saved to Cloud!")
+        time.sleep(1)
+        st.rerun()
+        
+    if col_discard.button("❌ Discard All"):
+        st.session_state.review_data = None
+        st.rerun()
+
+# --- ANALYTICS ---
 tab1, tab2, tab3 = st.tabs(["📊 Analytics", "📝 Ledger", "🤖 AI Insights"])
 with tab1:
     if not filtered_df.empty:
