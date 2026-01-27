@@ -20,34 +20,43 @@ BASE_DIR = Path(__file__).parent.absolute()
 DIRS = { "TEMP": BASE_DIR / "temp_uploads" }
 for d in DIRS.values(): d.mkdir(exist_ok=True)
 
+# CONSTANTS
+REQUIRED_COLS = ["Date", "Vendor", "Item", "Amount", "Currency", "IVA", "Category", "Sub_Category", "Is_Vice", "File"]
+
 # --- HELPER: SANITIZE DATA (Prevents Crashes) ---
 def sanitize_dataframe(df):
-    """Forces strict types to prevent Streamlit API Exceptions"""
-    if df.empty: return df
-    
-    # 1. Force Numbers
+    """Forces strict types and schema to prevent KeyErrors and API Exceptions"""
+    # 1. Ensure all columns exist
+    for col in REQUIRED_COLS:
+        if col not in df.columns:
+            df[col] = None
+            
+    # 2. Force Types
     df['Amount'] = pd.to_numeric(df['Amount'], errors='coerce').fillna(0.0)
     df['IVA'] = pd.to_numeric(df['IVA'], errors='coerce').fillna(0.0)
-    
-    # 2. Force Strings
-    for col in ['Vendor', 'Item', 'Currency', 'Category', 'Sub_Category', 'File']:
-        df[col] = df[col].astype(str).replace('nan', '')
-        
-    # 3. Force Booleans (Crucial for Checkboxes)
     df['Is_Vice'] = df['Is_Vice'].fillna(False).astype(bool)
-    
-    # 4. Force Dates
     df['Date'] = pd.to_datetime(df['Date'], errors='coerce').fillna(pd.Timestamp.now())
-    return df
+    
+    # 3. Fill text strings
+    for col in ['Vendor', 'Item', 'Currency', 'Category', 'Sub_Category', 'File']:
+        df[col] = df[col].astype(str).replace('nan', '').replace('None', '')
+        
+    return df[REQUIRED_COLS] # Return strictly ordered columns
 
 # --- DATABASE ---
 def load_data():
     conn = st.connection("gsheets", type=GSheetsConnection)
     try:
-        df = conn.read(worksheet="Sheet1", usecols=list(range(10)), ttl=5)
-        df = df.dropna(how="all")
+        # Load whatever is there
+        df = conn.read(worksheet="Sheet1", ttl=0)
+        # If it's totally empty or weird, return empty structure
+        if df.empty or len(df.columns) < 2:
+            return pd.DataFrame(columns=REQUIRED_COLS)
+        # Otherwise, heal it
         return sanitize_dataframe(df)
-    except: return pd.DataFrame(columns=["Date", "Vendor", "Item", "Amount", "Currency", "IVA", "Category", "Sub_Category", "Is_Vice", "File"])
+    except Exception:
+        # Fallback for connection errors
+        return pd.DataFrame(columns=REQUIRED_COLS)
 
 def save_data(df):
     conn = st.connection("gsheets", type=GSheetsConnection)
@@ -58,14 +67,10 @@ def save_data(df):
 
 # --- TAX LOGIC (2025/26 RULES) ---
 def calculate_accurate_tax(gross_annual, residency, tax_code):
-    """
-    Calculates Net Monthly Income using official bands.
-    """
     net_annual = 0.0
     
     if "UK" in residency:
-        # --- UK LOGIC (HMRC 2025) ---
-        # 1. Personal Allowance
+        # UK LOGIC
         allowance = 12570
         if tax_code and str(tax_code).upper().endswith('L'):
             try:
@@ -73,61 +78,40 @@ def calculate_accurate_tax(gross_annual, residency, tax_code):
                 allowance = digits * 10
             except: pass
             
-        # Reduced Personal Allowance (Income over £100k)
         if gross_annual > 100000:
             reduction = (gross_annual - 100000) / 2
             allowance = max(0, allowance - reduction)
             
         taxable_income = max(0, gross_annual - allowance)
         
-        # 2. Income Tax
         tax = 0.0
-        # Basic Rate (20% up to £37,700)
         if taxable_income > 0:
             band1 = min(taxable_income, 37700)
             tax += band1 * 0.20
-        # Higher Rate (40% from £37,701 to £125,140)
         if taxable_income > 37700:
             band2 = min(taxable_income - 37700, 125140 - 37700)
             tax += band2 * 0.40
-        # Additional Rate (45% over £125,140)
         if taxable_income > 125140:
             band3 = taxable_income - 125140
             tax += band3 * 0.45
             
-        # 3. National Insurance (Class 1 Employee - Approx 8% logic)
-        # Threshold: ~£12,570 start paying
         ni = 0.0
         if gross_annual > 12570:
             ni_band = min(gross_annual, 50270) - 12570
             ni += max(0, ni_band * 0.08)
-            
         if gross_annual > 50270:
             ni += (gross_annual - 50270) * 0.02
             
         net_annual = gross_annual - tax - ni
 
     elif "Spain" in residency:
-        # --- SPAIN IRPF (2025 Gen) ---
-        # 1. Social Security (Seguridad Social) ~6.35% capped
-        ss_base = min(gross_annual, 56646) # Max base approx
+        # SPAIN IRPF
+        ss_base = min(gross_annual, 56646) 
         ss_tax = ss_base * 0.0635
+        base_irpf = gross_annual - ss_tax - 2000 
         
-        # 2. IRPF Base
-        base_irpf = gross_annual - ss_tax - 2000 # Standard deduction
-        
-        # 3. Progressive Bands
         irpf = 0.0
-        bands = [
-            (12450, 0.19),
-            (20200, 0.24),
-            (35200, 0.30),
-            (60000, 0.37),
-            (300000, 0.45),
-            (float('inf'), 0.47)
-        ]
-        
-        remaining = base_irpf
+        bands = [(12450, 0.19), (20200, 0.24), (35200, 0.30), (60000, 0.37), (300000, 0.45)]
         previous_limit = 0
         
         for limit, rate in bands:
@@ -135,13 +119,10 @@ def calculate_accurate_tax(gross_annual, residency, tax_code):
                 taxable_in_band = min(base_irpf, limit) - previous_limit
                 irpf += taxable_in_band * rate
                 previous_limit = limit
-            else:
-                break
+            else: break
                 
         net_annual = gross_annual - ss_tax - irpf
-        
     else:
-        # Fallback 22%
         net_annual = gross_annual * 0.78
 
     return net_annual / 12
@@ -155,10 +136,7 @@ def process_upload(uploaded_file, api_key, user_vices, home_currency):
     temp_path = DIRS['TEMP'] / uploaded_file.name
     with open(temp_path, "wb") as f: f.write(uploaded_file.getbuffer())
     
-    # 1. Generate Content (Simulated for brevity, assume Gemini Client works)
     client = genai.Client(api_key=api_key)
-    
-    # --- PROMPT ---
     prompt = f"""
     Role: Forensic Auditor. Output strictly valid JSON.
     Format: [{{ "d": "YYYY-MM-DD", "v": "Vendor", "n": "Item", "p": 1.00, "c": "£", "mc": "Category", "sc": "Sub", "vice": false }}]
@@ -176,16 +154,13 @@ def process_upload(uploaded_file, api_key, user_vices, home_currency):
             contents=[prompt, types.Part.from_bytes(data=open(temp_path, "rb").read(), mime_type=mime)],
             config=types.GenerateContentConfig(response_mime_type='application/json')
         )
-        # Parse Response
         try: data = json.loads(res.text)
         except: 
-            # Hunter Seeker Regex
             match = re.search(r'\[.*\]', res.text, re.DOTALL)
             data = json.loads(match.group()) if match else []
             
         if isinstance(data, dict): data = data.get("items", [])
         
-        # Map to DataFrame Columns
         for i in data:
             extracted.append({
                 "Date": i.get("d"),
@@ -213,7 +188,6 @@ def generate_pdf_safe(df, goal_name, currency_symbol):
         pdf.set_font("Arial", size=10); pdf.cell(190, 10, f"Goal: {goal_name}", 0, 1, 'C'); pdf.ln(10)
         pdf.set_font("Arial", 'B', 12); pdf.cell(100, 10, f"Total: {currency_symbol}{df['Amount'].sum():.2f}", 1, 1)
         pdf.set_font("Arial", '', 8)
-        # Simple Table
         for _, row in df.iterrows():
             line = f"{str(row['Date'])[:10]} | {str(row['Vendor'])[:15]} | {str(row['Item'])[:30]} | {row['Amount']:.2f}"
             pdf.cell(190, 6, line.encode('latin-1', 'ignore').decode('latin-1'), 1, 1)
@@ -236,7 +210,6 @@ with st.sidebar:
     residency = st.selectbox("Select Country", ["UK (GBP)", "Spain (EUR)"], index=0)
     home_curr = "£" if "UK" in residency else "€"
     
-    # TAX CODE LOGIC
     tax_code_input = ""
     if "UK" in residency:
         tax_code_input = st.text_input("Tax Code", "1257L")
@@ -250,7 +223,6 @@ with st.sidebar:
     net_monthly = calculate_accurate_tax(gross_annual, residency, tax_code_input)
     
     st.metric("Net Monthly Income", f"{home_curr}{net_monthly:,.2f}")
-    st.caption("Calculated using 2025/26 Tax Bands")
     
     st.markdown("---")
     goal_name = st.text_input("Goal", "Daughter's Bike")
@@ -258,14 +230,13 @@ with st.sidebar:
     user_vices = st.text_area("Vices", "alcohol, candy, betting, tobacco")
     
     if st.button("⚠️ Clear Database"):
-        empty = pd.DataFrame(columns=df.columns)
+        empty = pd.DataFrame(columns=REQUIRED_COLS)
         save_data(empty)
         st.rerun()
 
 # 3. MAIN DASHBOARD
 st.title(f"🎯 Project: {goal_name}")
 
-# Metrics
 col1, col2, col3, col4 = st.columns(4)
 spent = df['Amount'].sum()
 vice_spend = df[df['Is_Vice']]['Amount'].sum()
@@ -287,7 +258,7 @@ if uploaded and st.button("🔍 Run Forensic Audit"):
     for idx, file in enumerate(uploaded):
         new_data = process_upload(file, api_key, user_vices, home_curr)
         if not new_data.empty:
-            # Auto-Fill missing vendors/dates (Smart Logic)
+            # Smart Logic
             new_data['Vendor'] = new_data['Vendor'].replace([None, 'null'], np.nan).ffill().bfill().fillna("Unknown")
             new_data['Date'] = pd.to_datetime(new_data['Date'], errors='coerce').ffill().bfill().fillna(pd.Timestamp.now())
             new_data['Currency'] = new_data['Currency'].fillna(home_curr)
@@ -304,21 +275,18 @@ if uploaded and st.button("🔍 Run Forensic Audit"):
             
     if all_new_rows:
         combined_new = pd.concat(all_new_rows, ignore_index=True)
-        # Store in session state for review
+        # Force Sanitize before showing editor
         st.session_state.review_data = sanitize_dataframe(combined_new)
         st.rerun()
 
-# 5. REVIEW ROOM (THE CRASH PROOF VERSION)
+# 5. REVIEW ROOM
 if 'review_data' in st.session_state and st.session_state.review_data is not None:
     st.divider()
     st.subheader("🧐 Review & Edit Results")
     st.info("Please verify the data below. Click Confirm to save to database.")
     
-    # Sanitize again just to be safe
-    safe_view = sanitize_dataframe(st.session_state.review_data)
-    
     edited_df = st.data_editor(
-        safe_view,
+        st.session_state.review_data,
         num_rows="dynamic",
         use_container_width=True,
         column_config={
@@ -333,7 +301,7 @@ if 'review_data' in st.session_state and st.session_state.review_data is not Non
     if col_save.button("✅ Confirm & Save"):
         final_df = pd.concat([df, edited_df], ignore_index=True)
         save_data(final_df)
-        st.session_state.review_data = None # Clear holding bay
+        st.session_state.review_data = None 
         st.success("Saved successfully!")
         time.sleep(1)
         st.rerun()
@@ -358,4 +326,4 @@ with tab2:
         st.dataframe(df, use_container_width=True)
         if st.download_button("Download CSV", df.to_csv(index=False), "data.csv"):
             pass
-            
+
