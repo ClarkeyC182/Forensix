@@ -25,6 +25,7 @@ REQUIRED_COLS = ["Date", "Vendor", "Item", "Amount", "Currency", "IVA", "Categor
 
 # --- HELPER: SAFE DATE PARSER ---
 def safe_parse_date(date_val):
+    """Prevents app crash when AI returns garbage text instead of a date."""
     try:
         s_val = str(date_val).strip().lower()
         if s_val in ['none', 'null', 'nan', '', 'yyyy-mm-dd', 'unknown', 'date']:
@@ -34,35 +35,43 @@ def safe_parse_date(date_val):
         return dt
     except: return pd.Timestamp.now()
 
-# --- DATABASE ENGINE ---
+# --- DATABASE ENGINE (TEMPLATE MERGE STRATEGY) ---
 def load_data():
+    # 1. Create the Perfect Master Template
     df_master = pd.DataFrame(columns=REQUIRED_COLS)
+    
     conn = st.connection("gsheets", type=GSheetsConnection)
     try:
+        # 2. Read Sheet (No Cache)
         df_sheet = conn.read(worksheet="Sheet1", ttl=0)
+        
+        # 3. Merge into Master Template (Forces columns to exist)
         if not df_sheet.empty:
             df_combined = pd.concat([df_master, df_sheet], ignore_index=True)
         else:
             df_combined = df_master
 
+        # 4. Strict Selection
         df_final = df_combined.reindex(columns=REQUIRED_COLS)
         
-        # Clean Types
+        # 5. Safe Cleaning
         df_final['Amount'] = pd.to_numeric(df_final['Amount'], errors='coerce').fillna(0.0)
         df_final['IVA'] = pd.to_numeric(df_final['IVA'], errors='coerce').fillna(0.0)
         df_final['Is_Vice'] = df_final['Is_Vice'].fillna(False).astype(bool)
         df_final['Date'] = df_final['Date'].apply(safe_parse_date)
         
-        # Clean Strings
         for c in ['Vendor', 'Item', 'Currency', 'Category', 'Sub_Category', 'File']:
             df_final[c] = df_final[c].astype(str).replace('nan', '').replace('None', '')
 
         return df_final
-    except: return df_master
+        
+    except Exception:
+        return df_master
 
 def save_data(df):
     conn = st.connection("gsheets", type=GSheetsConnection)
     df_save = df.copy()
+    # Format for storage
     df_save['Date'] = df_save['Date'].apply(safe_parse_date).dt.strftime('%Y-%m-%d')
     df_save['Amount'] = pd.to_numeric(df_save['Amount'], errors='coerce').fillna(0.0)
     df_save['IVA'] = pd.to_numeric(df_save['IVA'], errors='coerce').fillna(0.0)
@@ -140,20 +149,14 @@ def vision_slice_micro(image_path):
     return slices
 
 def analyze_chunk(content_bytes, mime_type, client, user_vices, home_currency):
-    # UPDATED: High-Precision Prompt
     prompt = f"""
-    Role: Senior Forensic Accountant.
-    Task: Extract individual line items from a receipt with EXTREME precision.
-    
-    Output JSON: [{{ "d": "YYYY-MM-DD", "v": "Vendor", "n": "Item", "p": 1.00, "c": "£", "mc": "Category", "sc": "Sub", "vice": false }}]
-    
-    CRITICAL RULES FOR ACCURACY:
-    1. **IGNORE TOTALS:** Do NOT extract lines that say 'Total', 'Subtotal', 'Balance', 'Cash', 'Change', 'VAT', or 'Card'.
-    2. **COLUMN AWARENESS:** The price is usually the *last* number on the right. Do NOT read 'Weight' (e.g. 0.205kg) or 'Product Code' (e.g. 4501) as the price.
-    3. **DECIMAL CHECK:** If a common grocery item (like 'Lemon', 'Milk', 'Bread') has a price > 50, you are likely missing a decimal point. Convert 207 -> 2.07.
-    4. **DATE:** Find the single transaction date. If missing, use null. NEVER return 'YYYY-MM-DD'.
-    5. **CURRENCY:** Default {home_currency}.
-    6. **VICES:** Check against keywords: {user_vices}.
+    Role: Forensic Auditor. Extract items.
+    JSON Format: [{{ "d": "YYYY-MM-DD", "v": "Vendor", "n": "Item", "p": 1.00, "c": "£", "mc": "Category", "sc": "Sub", "vice": false }}]
+    Rules: 
+    1. IGNORE 'Total', 'Subtotal', 'Cash', 'Card'.
+    2. Date: Use main date or null. NO 'YYYY-MM-DD'.
+    3. Currency default {home_currency}. 
+    4. Vice keywords: {user_vices}.
     """
     try:
         res = client.models.generate_content(
@@ -191,17 +194,22 @@ def process_upload(uploaded_file, api_key, user_vices, home_currency):
     
     extracted = []
     for i in raw_items:
-        # LOGIC FILTER: Python-side sanity check for "Totals"
+        # 1. Filter out Totals
         item_name = str(i.get("n", "")).lower()
         if any(x in item_name for x in ["total", "subtotal", "balance", "change", "cash", "amount due"]):
             continue 
 
-        # SANITY CHECK: The "Lemon Filter"
-        # If item is Groceries and Price > 100, assume decimal error and divide by 100
-        price = float(i.get("p", 0.0))
+        # 2. Safe Price Conversion (FIXES TYPE ERROR)
+        try: 
+            raw_price = i.get("p", 0.0)
+            if raw_price is None: raw_price = 0.0
+            price = float(raw_price)
+        except: 
+            price = 0.0
+
+        # 3. Lemon Filter (Decimal correction)
         cat = str(i.get("mc", "Shopping"))
         if price > 100 and cat in ["Groceries", "Dining", "Alcohol"]:
-             # Heuristic: Most grocery items are not > 100. Correct 207 -> 2.07
              price = price / 100.0
 
         extracted.append({
@@ -236,7 +244,6 @@ with st.sidebar:
     if "UK" in residency:
         tax_code_input = st.text_input("Tax Code (Optional)", "1257L")
     
-    st.subheader("💰 Income Calculator")
     col1, col2 = st.columns(2)
     income_freq = col1.selectbox("Freq", ["Yearly", "Monthly", "Hourly"])
     gross_income = col2.number_input("Gross", 35000.0, step=1000.0)
@@ -292,9 +299,10 @@ if uploaded and st.button("🔍 Run Forensic Audit"):
     for idx, file in enumerate(uploaded):
         new_data = process_upload(file, api_key, user_vices, home_curr)
         if not new_data.empty:
-            # Auto-Fill Logic
+            # Auto-Fill
             new_data['Vendor'] = new_data['Vendor'].replace([None, 'null'], np.nan).ffill().bfill().fillna("Unknown")
             
+            # Date Filling
             real_dates = new_data['Date'].replace([None, 'null'], np.nan).dropna()
             if not real_dates.empty:
                 common_date = real_dates.mode()[0] 
@@ -316,7 +324,6 @@ if uploaded and st.button("🔍 Run Forensic Audit"):
             
     if all_new_rows:
         combined_new = pd.concat(all_new_rows, ignore_index=True)
-        # UI Date fix
         combined_new['Date'] = pd.to_datetime(combined_new['Date']).dt.date
         st.session_state.review_data = combined_new
         st.rerun()
@@ -355,7 +362,7 @@ if 'review_data' in st.session_state and st.session_state.review_data is not Non
         st.session_state.review_data = None
         st.rerun()
 
-# 6. TABS
+# 6. TABS (FIXED TYPO)
 tab1, tab2 = st.tabs(["📊 Analytics", "📝 Ledger"])
 with tab1:
     if not df.empty:
@@ -363,3 +370,4 @@ with tab1:
 with tab2:
     if not df.empty:
         st.dataframe(df, use_container_width=True)
+        
