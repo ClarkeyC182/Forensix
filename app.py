@@ -36,7 +36,7 @@ def safe_date(val):
     """
     STRICT DATE PARSER:
     1. Parses DD/MM/YYYY.
-    2. BARRIER: If date > Today, reset to Today. (Fixes 2026 hallucinations).
+    2. BARRIER: If date > Today, reset to Today.
     3. BARRIER: If date < 2020, reset to Today.
     """
     try:
@@ -46,10 +46,9 @@ def safe_date(val):
         dt = pd.to_datetime(val, errors='coerce', dayfirst=True)
         if pd.isna(dt): return pd.Timestamp.now()
         
-        # TIME BARRIER
         now = pd.Timestamp.now()
-        if dt > now: return now # Future dates are impossible for receipts
-        if dt.year < 2020: return now # Too old to be relevant
+        if dt > now: return now # Future dates are impossible
+        if dt.year < 2020: return now # Too old
         
         return dt
     except: return pd.Timestamp.now()
@@ -67,7 +66,6 @@ def load_data():
 
         df_final = df_final.reindex(columns=REQUIRED_COLS)
         
-        # Sanitize
         df_final['Amount'] = df_final['Amount'].apply(safe_float)
         df_final['IVA'] = df_final['IVA'].apply(safe_float)
         df_final['Is_Vice'] = df_final['Is_Vice'].fillna(False).astype(bool)
@@ -119,7 +117,6 @@ def get_api_key():
 def resize_image_force(image_path):
     try:
         with Image.open(image_path) as img:
-            # 3500px is the sweet spot for clarity vs speed
             if img.width > 3500 or img.height > 3500:
                 img.thumbnail((3500, 3500), Image.Resampling.LANCZOS)
                 img.save(image_path, optimize=True, quality=70)
@@ -203,10 +200,16 @@ def process_upload(uploaded_file, api_key, user_vices, home_currency):
     for i in raw_items:
         name = str(i.get("n", "")).strip()
         name_lower = name.lower()
-        if any(x in name_lower for x in ["total", "subtotal", "balance", "change", "cash", "due", "visa", "auth"]): continue
+        
+        # 1. HEADER & TOTAL FILTER (Expanded)
+        # Filters out rows that are just headers or totals
+        blacklist = ["total", "subtotal", "balance", "change", "cash", "due", "visa", "auth", "item", "description", "producto", "descripción", "cantidad", "precio", "importe"]
+        if any(x in name_lower for x in blacklist): continue
+        if name_lower in ["item", "desc"]: continue # Strict exact match check
         
         price = safe_float(i.get("p"))
         
+        # 2. Price Swap
         if price == 0.0 and re.match(r'^\d+\.?\d*$', name):
             try:
                 price = float(name)
@@ -227,7 +230,6 @@ def process_upload(uploaded_file, api_key, user_vices, home_currency):
         sub_cat = str(i.get("sc", "General"))
         is_vice = bool(i.get("vice", False))
         
-        # SMART CATEGORIZER
         if cat in ["Unknown", "Shopping", "None"]:
             if vendor in ["MERCADONA", "LIDL", "SPAR", "TESCO", "ALDI"]: cat = "Groceries"
             elif vendor in ["ALE-HOP", "AMAZON"]: cat = "Shopping"
@@ -238,9 +240,8 @@ def process_upload(uploaded_file, api_key, user_vices, home_currency):
             if any(k in name_lower for k in ["wine", "beer", "cerveza", "vino", "vodka", "ron"]): cat = "Alcohol"
             elif "chocolate" in name_lower or "candy" in name_lower: cat = "Groceries"
 
-        # VENDOR / ITEM MISMATCH DETECTOR
-        # If Vendor is a Gift Shop but item is Food -> Flag it
-        food_words = ["pizza", "arroz", "pollo", "leche", "pan", "yogur"]
+        # Vendor/Item Mismatch Check
+        food_words = ["pizza", "arroz", "pollo", "leche", "pan", "yogur", "water", "bread"]
         if vendor in ["ALE-HOP", "ZARA", "H&M"] and any(f in name_lower for f in food_words):
             vendor = f"{vendor} (Check?)"
 
@@ -314,11 +315,18 @@ with st.sidebar:
     # --- INTERACTIVE FILTERS ---
     st.divider()
     st.subheader("🔍 Filters")
-    min_date = df['Date'].min().date() if not df.empty else datetime.now().date()
-    max_date = df['Date'].max().date() if not df.empty else datetime.now().date()
-    if min_date == max_date: min_date = min_date - pd.Timedelta(days=1)
+    if not df.empty:
+        df['Date'] = pd.to_datetime(df['Date'])
+        min_dt = df['Date'].min().date()
+        max_dt = df['Date'].max().date()
+    else:
+        min_dt = datetime.now().date()
+        max_dt = datetime.now().date()
     
-    date_range = st.slider("Date Range", min_value=min_date, max_value=max_date, value=(min_date, max_date))
+    if min_dt >= max_dt:
+        min_dt = max_dt - pd.Timedelta(days=1)
+    
+    date_range = st.slider("Date Range", min_value=min_dt, max_value=max_dt, value=(min_dt, max_dt))
     all_cats = list(df['Category'].unique()) if not df.empty else []
     selected_cats = st.multiselect("Category", all_cats, default=all_cats)
     
@@ -359,7 +367,6 @@ if uploaded and st.button("🔍 Audit"):
         data = process_upload(f, api_key, user_vices, home_curr)
         if not data.empty: 
             data['Date'] = data['Date'].apply(safe_date)
-            # Safe Mode for Date
             if not data['Date'].isna().all():
                 mode_date = data['Date'].mode()[0]
                 data['Date'] = data['Date'].fillna(mode_date)
@@ -387,6 +394,7 @@ if 'review_data' in st.session_state and st.session_state.review_data is not Non
         column_config={
             "Date": st.column_config.DateColumn("Date", format="YYYY-MM-DD"),
             "Amount": st.column_config.NumberColumn("Amount", format="%.2f"),
+            "Is_Vice": st.column_config.CheckboxColumn("Vice?", default=False),
             "Category": st.column_config.SelectboxColumn("Category", options=["Groceries", "Alcohol", "Dining", "Transport", "Shopping", "Utilities", "Services"])
         }
     )
@@ -399,17 +407,14 @@ if 'review_data' in st.session_state and st.session_state.review_data is not Non
     if st.button("❌ Discard"):
         st.session_state.review_data = None; st.rerun()
 
-# 7. ANALYTICS (PRO VISUALS)
+# 7. ANALYTICS
 t1, t2 = st.tabs(["📊 Executive View", "📝 Data Ledger"])
 with t1:
     if not df_filtered.empty:
-        
-        # COLOR SCALE (Sexy Professional)
         domain = ["Groceries", "Alcohol", "Dining", "Transport", "Shopping", "Utilities", "Services", "Unknown"]
         range_ = ["#2ecc71", "#9b59b6", "#e67e22", "#3498db", "#f1c40f", "#95a5a6", "#34495e", "#bdc3c7"]
         
         c1, c2 = st.columns(2)
-        
         with c1:
             if len(selected_cats) == 1:
                 cat_name = selected_cats[0]
@@ -444,31 +449,20 @@ with t1:
             
         st.subheader("📈 Financial Heartbeat (Timeline)")
         base_line = alt.Chart(df_filtered).encode(x='Date')
-        area = base_line.mark_area(opacity=0.3).encode(
-            y='sum(Amount)', 
-            color=alt.Color('Category', scale=alt.Scale(domain=domain, range=range_))
-        )
-        line = base_line.mark_line().encode(
-            y='sum(Amount)', 
-            color=alt.Color('Category', scale=alt.Scale(domain=domain, range=range_)),
-            tooltip=['Date', 'Category', 'sum(Amount)']
-        )
+        area = base_line.mark_area(opacity=0.3).encode(y='sum(Amount)', color=alt.Color('Category', scale=alt.Scale(domain=domain, range=range_)))
+        line = base_line.mark_line().encode(y='sum(Amount)', color=alt.Color('Category', scale=alt.Scale(domain=domain, range=range_)), tooltip=['Date', 'Category', 'sum(Amount)'])
         st.altair_chart((area + line).interactive(), use_container_width=True)
             
         c3, c4 = st.columns(2)
         with c3:
             st.subheader("🏆 Top Vendors")
             top_vendors = df_filtered.groupby("Vendor")['Amount'].sum().reset_index().sort_values("Amount", ascending=False).head(5)
-            v_chart = alt.Chart(top_vendors).mark_bar().encode(
-                x='Amount', y=alt.Y('Vendor', sort='-x'), color=alt.Color('Vendor', legend=None)
-            )
+            v_chart = alt.Chart(top_vendors).mark_bar().encode(x='Amount', y=alt.Y('Vendor', sort='-x'), color=alt.Color('Vendor', legend=None))
             st.altair_chart(v_chart, use_container_width=True)
         with c4:
             st.subheader("💎 Top Items")
             top_items = df_filtered.sort_values("Amount", ascending=False).head(5)
-            i_chart = alt.Chart(top_items).mark_bar().encode(
-                x='Amount', y=alt.Y('Item', sort='-x'), color=alt.Color('Category', scale=alt.Scale(domain=domain, range=range_))
-            )
+            i_chart = alt.Chart(top_items).mark_bar().encode(x='Amount', y=alt.Y('Item', sort='-x'), color=alt.Color('Category', scale=alt.Scale(domain=domain, range=range_)))
             st.altair_chart(i_chart, use_container_width=True)
 
 with t2:
