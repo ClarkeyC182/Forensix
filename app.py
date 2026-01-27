@@ -23,13 +23,16 @@ for d in DIRS.values(): d.mkdir(exist_ok=True)
 # CONSTANTS
 REQUIRED_COLS = ["Date", "Vendor", "Item", "Amount", "Currency", "IVA", "Category", "Sub_Category", "Is_Vice", "File"]
 
-# --- HELPER: SAFE DATE PARSER ---
+# --- HELPER: SAFE DATE PARSER (Fixes the YYYY-MM-DD crash) ---
 def safe_parse_date(date_val):
     """Handles garbage dates like 'YYYY-MM-DD' or 'None' safely"""
     try:
-        if pd.isna(date_val) or str(date_val).strip().lower() in ['none', 'null', 'yyyy-mm-dd', '']:
+        # Check for known garbage strings from AI
+        s_val = str(date_val).strip().lower()
+        if s_val in ['none', 'null', 'yyyy-mm-dd', '', 'nan']:
             return pd.Timestamp.now()
-        # Let pandas guess the format, coerce errors to NaT (Not a Time)
+            
+        # Try to convert
         dt = pd.to_datetime(date_val, errors='coerce')
         if pd.isna(dt):
             return pd.Timestamp.now()
@@ -41,30 +44,29 @@ def safe_parse_date(date_val):
 def load_data():
     conn = st.connection("gsheets", type=GSheetsConnection)
     try:
-        # Load data without caching to ensure freshness
+        # Load without cache
         df = conn.read(worksheet="Sheet1", ttl=0)
         
-        # SAFETY CHECK: If sheet is empty or missing columns, create a clean empty structure
-        # This prevents the KeyError 'Amount' crash on startup
+        # SAFETY CHECK 1: If empty or weird, start fresh
         if df.empty or len(df.columns) < len(REQUIRED_COLS):
             return pd.DataFrame(columns=REQUIRED_COLS)
             
-        # Ensure all required columns exist in memory, even if missing in Sheet
+        # SAFETY CHECK 2: Ensure every column exists in memory
         for col in REQUIRED_COLS:
             if col not in df.columns:
                 df[col] = None
                 
-        # Clean Data Types immediately upon load
+        # Clean Data Types (The Anti-Crash Layer)
         df['Amount'] = pd.to_numeric(df['Amount'], errors='coerce').fillna(0.0)
         df['IVA'] = pd.to_numeric(df['IVA'], errors='coerce').fillna(0.0)
         df['Is_Vice'] = df['Is_Vice'].fillna(False).astype(bool)
         
-        # Safe Date Parsing
+        # Apply Safe Date Parsing
         df['Date'] = df['Date'].apply(safe_parse_date)
         
         return df[REQUIRED_COLS]
     except Exception:
-        # If connection completely fails, return safe empty dataframe
+        # Ultimate fallback
         return pd.DataFrame(columns=REQUIRED_COLS)
 
 def save_data(df):
@@ -183,7 +185,6 @@ def process_upload(uploaded_file, api_key, user_vices, home_currency):
     temp_path = DIRS['TEMP'] / uploaded_file.name
     with open(temp_path, "wb") as f: f.write(uploaded_file.getbuffer())
     client = genai.Client(api_key=api_key)
-    
     raw_items = []
     
     if uploaded_file.type == "application/pdf":
@@ -252,24 +253,29 @@ with st.sidebar:
     goal_target = st.number_input("Target Amount", 150.0)
     user_vices = st.text_area("Vices", "alcohol, candy, betting, tobacco")
     
-    # EXPORT / REPAIR
-    if st.button("⚠️ Force Clear DB"):
-        conn = st.connection("gsheets", type=GSheetsConnection)
-        empty = pd.DataFrame(columns=REQUIRED_COLS)
-        conn.update(worksheet="Sheet1", data=empty)
-        st.cache_data.clear()
-        st.rerun()
-        
     if not df.empty:
         st.write("### 📥 Export")
         st.download_button("📊 CSV", df.to_csv(index=False), "data.csv", "text/csv")
         pdf_data = generate_pdf_safe(df, goal_name, home_curr)
         if pdf_data: st.download_button("📄 PDF", pdf_data, "report.pdf", "application/pdf")
 
+    # DB CLEAR BUTTON
+    if st.button("⚠️ Force Clear DB"):
+        try:
+            conn = st.connection("gsheets", type=GSheetsConnection)
+            # Create fresh DF with ALL required cols
+            empty = pd.DataFrame(columns=REQUIRED_COLS)
+            conn.update(worksheet="Sheet1", data=empty)
+            st.cache_data.clear()
+            st.success("Database Reset!")
+            time.sleep(1)
+            st.rerun()
+        except: st.error("Failed to clear. Check Sheets permissions.")
+
 # 3. DASHBOARD
 st.title(f"🎯 Project: {goal_name}")
 
-# Metrics
+# KPIS
 col1, col2, col3, col4 = st.columns(4)
 spent = df['Amount'].sum()
 vice_spend = df[df['Is_Vice']]['Amount'].sum()
@@ -293,7 +299,8 @@ if uploaded and st.button("🔍 Run Forensic Audit"):
         if not new_data.empty:
             # Auto-Fill Logic (Vendor / Date)
             new_data['Vendor'] = new_data['Vendor'].replace([None, 'null'], np.nan).ffill().bfill().fillna("Unknown")
-            # Apply safe date parser to new data
+            
+            # Apply safe date parser
             new_data['Date'] = new_data['Date'].apply(safe_parse_date)
             new_data['Currency'] = new_data['Currency'].fillna(home_curr)
             
@@ -309,8 +316,6 @@ if uploaded and st.button("🔍 Run Forensic Audit"):
             
     if all_new_rows:
         combined_new = pd.concat(all_new_rows, ignore_index=True)
-        # Convert Dates for UI Editor
-        combined_new['Date'] = combined_new['Date'].dt.date
         st.session_state.review_data = combined_new
         st.rerun()
 
