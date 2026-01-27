@@ -39,13 +39,19 @@ def load_data():
     conn = st.connection("gsheets", type=GSheetsConnection)
     try:
         df = conn.read(worksheet="Sheet1", ttl=0)
+        
+        # Self-Healing: If sheet is totally empty/broken, return empty DF to trigger repair UI
+        if df.empty or len(df.columns) < 2: 
+            return pd.DataFrame(columns=REQUIRED_COLS)
+            
         # Filter out the dummy row so user doesn't see it
-        if not df.empty and "Item" in df.columns:
+        if "Item" in df.columns:
             df = df[df["Item"] != "Initialization"]
         
-        # Self-Heal Columns
+        # Ensure all columns exist
         for col in REQUIRED_COLS:
             if col not in df.columns: df[col] = None
+            
         return df[REQUIRED_COLS]
     except: return pd.DataFrame(columns=REQUIRED_COLS)
 
@@ -304,4 +310,3 @@ with t1:
         st.altair_chart(alt.Chart(df).mark_bar().encode(x='Category', y='Amount', color='Category'), use_container_width=True)
 with t2:
     if not df.empty: st.dataframe(df, use_container_width=True)
-        
