@@ -27,7 +27,7 @@ for d in DIRS.values(): d.mkdir(exist_ok=True)
 
 DB_PATH = DIRS["DB"] / "forensix.db"
 
-# --- CORE: DATABASE MANAGER (SQLite) ---
+# --- CORE: DATABASE MANAGER ---
 class DatabaseManager:
     def __init__(self, db_path):
         self.db_path = str(db_path)
@@ -37,18 +37,13 @@ class DatabaseManager:
         return sqlite3.connect(self.db_path, check_same_thread=False)
 
     def _init_db(self):
-        """Initialize the SQL tables if they don't exist."""
         conn = self._get_conn()
         c = conn.cursor()
-        
-        # 1. Users Table
         c.execute('''CREATE TABLE IF NOT EXISTS users (
             username TEXT PRIMARY KEY,
             password_hash TEXT NOT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )''')
-        
-        # 2. Transactions Table
         c.execute('''CREATE TABLE IF NOT EXISTS transactions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT,
@@ -70,7 +65,6 @@ class DatabaseManager:
     def create_user(self, username, password):
         conn = self._get_conn()
         c = conn.cursor()
-        # Simple hash (In production, use bcrypt/salt)
         pwd_hash = hashlib.sha256(password.encode()).hexdigest()
         try:
             c.execute("INSERT INTO users (username, password_hash) VALUES (?, ?)", (username, pwd_hash))
@@ -92,34 +86,24 @@ class DatabaseManager:
 
     def add_transactions(self, username, df):
         conn = self._get_conn()
-        # Add username column to DF for SQL insertion
         df['username'] = username
-        # Ensure boolean is int for SQLite
         df['is_vice'] = df['Is_Vice'].astype(int) 
-        
-        # Rename cols to match SQL
         df_sql = df.rename(columns={
             "Date": "date", "Vendor": "vendor", "Item": "item", 
             "Amount": "amount", "Currency": "currency", "IVA": "iva",
             "Category": "category", "Sub_Category": "sub_category", 
             "File": "file_name"
         })
-        
-        # Select only relevant columns
         cols = ["username", "date", "vendor", "item", "amount", "currency", "iva", "category", "sub_category", "is_vice", "file_name"]
         df_sql[cols].to_sql("transactions", conn, if_exists="append", index=False)
         conn.close()
 
     def get_user_data(self, username):
         conn = self._get_conn()
-        query = "SELECT * FROM transactions WHERE username = ?"
-        df = pd.read_sql_query(query, conn, params=(username,))
+        df = pd.read_sql_query("SELECT * FROM transactions WHERE username = ?", conn, params=(username,))
         conn.close()
+        if df.empty: return pd.DataFrame(columns=REQUIRED_COLS)
         
-        if df.empty:
-            return pd.DataFrame(columns=["Date", "Vendor", "Item", "Amount", "Currency", "IVA", "Category", "Sub_Category", "Is_Vice", "File"])
-        
-        # Format back to App Standards
         df = df.rename(columns={
             "date": "Date", "vendor": "Vendor", "item": "Item", 
             "amount": "Amount", "currency": "Currency", "iva": "IVA",
@@ -137,6 +121,8 @@ class DatabaseManager:
         conn.close()
 
 # --- UTILS ---
+REQUIRED_COLS = ["Date", "Vendor", "Item", "Amount", "Currency", "IVA", "Category", "Sub_Category", "Is_Vice", "File"]
+
 def safe_float(val):
     try: return float(val) if val else 0.0
     except: return 0.0
@@ -144,9 +130,10 @@ def safe_float(val):
 def safe_date(val):
     try:
         dt = pd.to_datetime(val, errors='coerce', dayfirst=True)
-        if pd.isna(dt): return pd.Timestamp.now()
-        if dt > pd.Timestamp.now(): return pd.Timestamp.now()
-        if dt.year < 2020: return pd.Timestamp.now()
+        now = pd.Timestamp.now()
+        if pd.isna(dt): return now
+        if dt > now: return now
+        if dt.year < 2020: return now
         return dt
     except: return pd.Timestamp.now()
 
@@ -165,9 +152,7 @@ class AIEngine:
 
     def analyze_image(self, image_path, mime_type, user_vices, currency):
         if not self.client: return []
-        
-        with open(image_path, "rb") as f:
-            content = f.read()
+        with open(image_path, "rb") as f: content = f.read()
 
         prompt = f"""
         Role: Forensic Auditor. Extract EVERY line item.
@@ -193,43 +178,39 @@ class AIEngine:
 db = DatabaseManager(DB_PATH)
 
 def main():
-    # --- AUTHENTICATION ---
-    if 'user' not in st.session_state:
-        st.session_state.user = None
-
-    if not st.session_state.user:
-        login_screen()
-    else:
-        dashboard_screen()
+    if 'user' not in st.session_state: st.session_state.user = None
+    if not st.session_state.user: login_screen()
+    else: dashboard_screen()
 
 def login_screen():
-    c1, c2, c3 = st.columns([1,2,1])
+    # Centered simple layout
+    c1, c2, c3 = st.columns([1, 1, 1])
     with c2:
-        st.title("🔐 Forensix Pro")
-        tab1, tab2 = st.tabs(["Login", "Sign Up"])
+        st.markdown("<h1 style='text-align: center;'>🔐 Forensix Pro</h1>", unsafe_allow_html=True)
+        tab1, tab2 = st.tabs(["Login", "Join"])
         
         with tab1:
-            username = st.text_input("Username", key="login_user")
-            password = st.text_input("Password", type="password", key="login_pass")
-            if st.button("Login"):
-                if db.verify_user(username, password):
-                    st.session_state.user = username
-                    st.success("Welcome back!")
-                    st.rerun()
-                else:
-                    st.error("Invalid credentials")
+            with st.form("login_form"):
+                username = st.text_input("Username")
+                password = st.text_input("Password", type="password")
+                if st.form_submit_button("Sign In", use_container_width=True):
+                    if db.verify_user(username, password):
+                        st.session_state.user = username
+                        st.rerun()
+                    else:
+                        st.error("Invalid credentials")
         
         with tab2:
-            new_user = st.text_input("New Username", key="new_user")
-            new_pass = st.text_input("New Password", type="password", key="new_pass")
-            if st.button("Create Account"):
-                if db.create_user(new_user, new_pass):
-                    st.success("Account created! Please login.")
-                else:
-                    st.error("Username already exists.")
+            with st.form("signup_form"):
+                new_user = st.text_input("New Username")
+                new_pass = st.text_input("New Password", type="password")
+                if st.form_submit_button("Create Account", use_container_width=True):
+                    if db.create_user(new_user, new_pass):
+                        st.success("Created! Please Login.")
+                    else:
+                        st.error("Username taken.")
 
 def dashboard_screen():
-    # --- SIDEBAR ---
     with st.sidebar:
         st.write(f"👤 **{st.session_state.user}**")
         if st.button("Log Out"):
@@ -246,19 +227,14 @@ def dashboard_screen():
             db.clear_user_data(st.session_state.user)
             st.rerun()
 
-    # --- MAIN CONTENT ---
     st.title("📊 Forensic Dashboard")
-    
-    # Load User Data
     df = db.get_user_data(st.session_state.user)
     
-    # METRICS ROW
+    # METRICS
     if not df.empty:
         c1, c2, c3 = st.columns(3)
-        total = df['Amount'].sum()
-        vice_total = df[df['Is_Vice']]['Amount'].sum()
-        c1.metric("Total Spend", f"{home_curr}{total:,.2f}")
-        c2.metric("Vice Leakage", f"{home_curr}{vice_total:,.2f}")
+        c1.metric("Total Spend", f"{home_curr}{df['Amount'].sum():.2f}")
+        c2.metric("Vice Leakage", f"{home_curr}{df[df['Is_Vice']]['Amount'].sum():.2f}")
         c3.metric("Transactions", len(df))
     
     # TABS
@@ -266,56 +242,71 @@ def dashboard_screen():
     
     with tab_upload:
         uploaded = st.file_uploader("Upload Receipts (Image/PDF)", accept_multiple_files=True)
-        if uploaded and st.button("🔍 Run Forensic Audit"):
+        if uploaded and st.button("🔍 Run Forensic Audit", type="primary"):
             api_key = st.secrets["GEMINI_API_KEY"]
             ai = AIEngine(api_key)
             all_rows = []
             
-            bar = st.progress(0)
+            # PROGRESS TRACKING
+            status_box = st.status("Initializing Forensic Engine...", expanded=True)
+            progress_bar = st.progress(0)
+            
             for i, f in enumerate(uploaded):
-                # Save temp
-                tpath = DIRS["TEMP"] / f"{uuid.uuid4()}_{f.name}"
-                with open(tpath, "wb") as file: file.write(f.getbuffer())
-                
-                # Resize if image
-                if f.type != "application/pdf": resize_image_force(tpath)
-                
-                # Analyze
-                mime = "application/pdf" if f.type == "application/pdf" else "image/jpeg"
-                items = ai.analyze_image(tpath, mime, vices, home_curr)
-                
-                # Process Items
-                for item in items:
-                    name = str(item.get("n", "Item"))
-                    if any(x in name.lower() for x in ["total", "subtotal"]): continue
+                try:
+                    status_box.write(f"**Processing File {i+1}/{len(uploaded)}:** `{f.name}`")
                     
-                    price = safe_float(item.get("p"))
-                    # Lemon filter
-                    cat = item.get("mc", "Shopping")
-                    if price > 100 and cat in ["Groceries", "Dining"]: price /= 100.0
+                    # 1. Save
+                    tpath = DIRS["TEMP"] / f"{uuid.uuid4()}_{f.name}"
+                    with open(tpath, "wb") as file: file.write(f.getbuffer())
                     
-                    all_rows.append({
-                        "Date": safe_date(item.get("d")),
-                        "Vendor": item.get("v", "Unknown"),
-                        "Item": name,
-                        "Amount": price,
-                        "Currency": home_curr,
-                        "IVA": 0.0,
-                        "Category": cat,
-                        "Sub_Category": item.get("sc", "General"),
-                        "Is_Vice": bool(item.get("vice", False)),
-                        "File": f.name
-                    })
-                
-                # Clean up
-                if os.path.exists(tpath): os.remove(tpath)
-                bar.progress((i+1)/len(uploaded))
+                    # 2. Resize
+                    if f.type != "application/pdf":
+                        status_box.write(f"  ↳ Optimizing image resolution...")
+                        resize_image_force(tpath)
+                    
+                    # 3. AI Analysis
+                    status_box.write(f"  ↳ Sending to Gemini AI (This may take 10s)...")
+                    mime = "application/pdf" if f.type == "application/pdf" else "image/jpeg"
+                    items = ai.analyze_image(tpath, mime, vices, home_curr)
+                    
+                    status_box.write(f"  ↳ Found {len(items)} items. Cleaning data...")
+                    
+                    # 4. Processing
+                    for item in items:
+                        name = str(item.get("n", "Item"))
+                        blacklist = ["total", "subtotal", "balance", "change", "cash", "due", "visa", "auth", "item", "desc"]
+                        if any(x in name.lower() for x in blacklist): continue
+                        
+                        price = safe_float(item.get("p"))
+                        cat = item.get("mc", "Shopping")
+                        if price > 100 and cat in ["Groceries", "Dining"]: price /= 100.0
+                        
+                        all_rows.append({
+                            "Date": safe_date(item.get("d")),
+                            "Vendor": item.get("v", "Unknown"),
+                            "Item": name,
+                            "Amount": price,
+                            "Currency": home_curr,
+                            "IVA": 0.0,
+                            "Category": cat,
+                            "Sub_Category": item.get("sc", "General"),
+                            "Is_Vice": bool(item.get("vice", False)),
+                            "File": f.name
+                        })
+                    
+                    if os.path.exists(tpath): os.remove(tpath)
+                    progress_bar.progress((i + 1) / len(uploaded))
+                    
+                except Exception as e:
+                    status_box.error(f"Failed to process {f.name}: {str(e)}")
+                    continue
+            
+            status_box.update(label="Audit Complete!", state="complete", expanded=False)
             
             if all_rows:
                 new_df = pd.DataFrame(all_rows)
-                # Save to DB
                 db.add_transactions(st.session_state.user, new_df)
-                st.success(f"Processed {len(new_df)} items!")
+                st.success(f"Successfully audited {len(new_df)} transactions.")
                 time.sleep(1)
                 st.rerun()
 
@@ -335,7 +326,7 @@ def dashboard_screen():
                     tooltip=['Category', 'Amount']
                 ).interactive()
                 st.altair_chart(chart, use_container_width=True)
-                
+            
             with c2:
                 st.subheader("Timeline")
                 line = alt.Chart(df).mark_line(point=True).encode(
@@ -348,11 +339,8 @@ def dashboard_screen():
 
     with tab_ledger:
         if not df.empty:
-            # Editor
             edited_df = st.data_editor(df, num_rows="dynamic", use_container_width=True)
             if st.button("💾 Save Changes"):
-                # For SQLite, full replace is easiest for MVP editing
-                # In prod, we would update specific rows by ID
                 db.clear_user_data(st.session_state.user)
                 db.add_transactions(st.session_state.user, edited_df)
                 st.success("Saved!")
@@ -360,4 +348,4 @@ def dashboard_screen():
 
 if __name__ == "__main__":
     main()
-
+    
