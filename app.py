@@ -41,6 +41,9 @@ class DatabaseManager:
         c.execute('''CREATE TABLE IF NOT EXISTS users (
             username TEXT PRIMARY KEY,
             password_hash TEXT NOT NULL,
+            currency TEXT DEFAULT '£',
+            gross_income REAL DEFAULT 0,
+            tax_residency TEXT DEFAULT 'UK',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )''')
         c.execute('''CREATE TABLE IF NOT EXISTS transactions (
@@ -82,6 +85,22 @@ class DatabaseManager:
         user = c.fetchone()
         conn.close()
         return user is not None
+
+    def update_user_profile(self, username, gross_income, residency, currency):
+        conn = self._get_conn()
+        conn.execute("UPDATE users SET gross_income = ?, tax_residency = ?, currency = ? WHERE username = ?", 
+                     (gross_income, residency, currency, username))
+        conn.commit()
+        conn.close()
+
+    def get_user_profile(self, username):
+        conn = self._get_conn()
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("SELECT * FROM users WHERE username = ?", (username,))
+        row = c.fetchone()
+        conn.close()
+        return dict(row) if row else {}
 
     def add_transactions(self, username, df):
         conn = self._get_conn()
@@ -135,6 +154,43 @@ class DatabaseManager:
         conn.execute("DELETE FROM transactions WHERE username = ?", (username,))
         conn.commit()
         conn.close()
+
+# --- TAX LOGIC ---
+def calculate_net_monthly(gross, residency):
+    net = 0.0
+    if "UK" in residency:
+        # UK 2024/25 Bands
+        allowance = 12570
+        if gross > 100000: allowance = max(0, allowance - (gross - 100000) / 2)
+        taxable = max(0, gross - allowance)
+        
+        tax = 0.0
+        if taxable > 0: tax += min(taxable, 37700) * 0.20
+        if taxable > 37700: tax += min(taxable - 37700, 125140 - 37700) * 0.40
+        if taxable > 125140: tax += (taxable - 125140) * 0.45
+        
+        ni = 0.0
+        if gross > 12570: ni += min(max(0, gross - 12570), 50270 - 12570) * 0.08
+        if gross > 50270: ni += (gross - 50270) * 0.02
+        
+        net = gross - tax - ni
+    elif "Spain" in residency:
+        # Rough Spain IRPF (varies by region, this is a national approx)
+        ss = min(gross, 56646) * 0.0635
+        base = gross - ss - 2000
+        irpf, prev = 0.0, 0
+        bands = [(12450, 0.19), (20200, 0.24), (35200, 0.30), (60000, 0.37), (300000, 0.45)]
+        for lim, rate in bands:
+            if base > prev: 
+                irpf += (min(base, lim) - prev) * rate
+                prev = lim
+            else: break
+        net = gross - ss - irpf
+    else:
+        # Generic Estimator (25% tax)
+        net = gross * 0.75
+        
+    return net / 12
 
 # --- UTILS ---
 REQUIRED_COLS = ["Date", "Vendor", "Item", "Amount", "Currency", "IVA", "Category", "Sub_Category", "Is_Vice", "File"]
@@ -198,6 +254,7 @@ class AIEngine:
         6. CURRENCY: {currency}.
         """
         
+        # MODEL DAISY CHAIN
         models_to_try = ["gemini-1.5-pro", "gemini-2.0-flash", "gemini-1.5-flash"]
         for model in models_to_try:
             try:
@@ -209,24 +266,32 @@ class AIEngine:
                 return clean_json_response(res.text)
             except Exception as e:
                 if "429" in str(e): # Rate Limit
-                    time.sleep(2) # Backoff
+                    time.sleep(2)
                     continue
-                continue
+                continue # Try next model
         raise Exception("All AI models failed.")
 
     def generate_financial_advice(self, summary_text):
         prompt = f"""
-        Act as a financial coach. Analyze this spending summary.
-        Identify patterns in 'Discretionary Spending' (Vices) and 'Sub-Categories'.
-        Provide 3 short, direct, actionable tips to save money.
-        Do not lecture. Be helpful and professional.
+        Act as a "Forensic Accountant" for a wealthy client.
+        Analyze this spending summary. 
+        Focus on:
+        1. **Vice Leakage** (Where are they wasting money?)
+        2. **Spending Velocity** (Are they buying too much random stuff?)
+        3. **Sub-Category patterns** (e.g. Too much Cheese or Wine?)
+        
+        Output: 3 short, punchy, insightful bullet points. Be direct.
+        
         DATA: {summary_text}
         """
-        try:
-            res = self.client.models.generate_content(model="gemini-1.5-flash", contents=prompt)
-            return res.text
-        except Exception as e:
-            return f"Error: {str(e)}"
+        # DAISY CHAIN FOR ADVICE TOO
+        models_to_try = ["gemini-1.5-pro", "gemini-2.0-flash", "gemini-1.5-flash"]
+        for model in models_to_try:
+            try:
+                res = self.client.models.generate_content(model=model, contents=prompt)
+                return res.text
+            except: continue
+        return "⚠️ AI Advice Unavailable (API Busy)"
 
 # --- APP LOGIC ---
 db = DatabaseManager(DB_PATH)
@@ -261,74 +326,96 @@ def login_screen():
                     else: st.error("Taken")
 
 def dashboard_screen():
+    # Load User & Profile
     df = db.get_user_data(st.session_state.user)
+    profile = db.get_user_profile(st.session_state.user)
+    
+    # Defaults
+    home_curr = profile.get('currency', '£')
+    user_residency = profile.get('tax_residency', 'UK')
+    user_gross = profile.get('gross_income', 0.0)
     
     with st.sidebar:
         st.write(f"👤 **{st.session_state.user}**")
         if st.button("Log Out"):
             st.session_state.user = None
             st.rerun()
+        
         st.divider()
-        residency = st.selectbox("Residency", ["UK (GBP)", "Spain (EUR)"])
-        home_curr = "£" if "UK" in residency else "€"
+        st.subheader("💰 Financial Profile")
+        
+        # Profile Editor
+        with st.form("profile_form"):
+            new_residency = st.selectbox("Residency", ["UK (GBP)", "Spain (EUR)", "Other (USD)"], 
+                                         index=0 if "UK" in user_residency else 1 if "Spain" in user_residency else 2)
+            new_gross = st.number_input("Annual Gross Income", value=float(user_gross), step=1000.0)
+            
+            if st.form_submit_button("Update Profile"):
+                curr = "£" if "UK" in new_residency else "€" if "Spain" in new_residency else "$"
+                db.update_user_profile(st.session_state.user, new_gross, new_residency, curr)
+                st.success("Updated!")
+                time.sleep(0.5); st.rerun()
+        
+        st.divider()
         vices = st.text_area("Vices", "alcohol, candy, betting")
-        st.divider()
         if st.button("🗑️ Reset Data"):
             db.clear_user_data(st.session_state.user)
             st.rerun()
 
     st.title("📊 Forensic Dashboard")
     
+    # CALCULATE FINANCIALS
+    net_monthly = calculate_net_monthly(user_gross, user_residency)
+    total_spend = df['Amount'].sum() if not df.empty else 0.0
+    vice_spend = df[df['Is_Vice']]['Amount'].sum() if not df.empty else 0.0
+    remaining = net_monthly - total_spend
+    
+    # TOP METRICS ROW
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Net Monthly Income", f"{home_curr}{net_monthly:,.2f}")
+    c2.metric("Total Spend", f"{home_curr}{total_spend:,.2f}")
+    c3.metric("Remaining", f"{home_curr}{remaining:,.2f}", delta="Surplus" if remaining > 0 else "Deficit")
+    c4.metric("Vice Leakage", f"{home_curr}{vice_spend:,.2f}", delta="Waste", delta_color="inverse")
+    
+    # FILTER BAR
     if not df.empty:
         today = datetime.now()
         start_date = df['Date'].min() if df['Date'].notna().any() else today
         end_date = df['Date'].max() if df['Date'].notna().any() else today
-
-        c1, c2, c3, c4 = st.columns(4)
-        with c1: 
-            if st.button("📅 This Month", use_container_width=True):
-                start_date = today.replace(day=1)
-                end_date = today
-        with c2:
-            if st.button("📅 Last Month", use_container_width=True):
-                first_of_this = today.replace(day=1)
-                end_date = first_of_this - timedelta(days=1)
-                start_date = end_date.replace(day=1)
-        with c3:
-            if st.button("📅 YTD", use_container_width=True):
-                start_date = today.replace(month=1, day=1)
-                end_date = today
-        with c4:
-            if st.button("📅 All Time", use_container_width=True):
-                start_date = df['Date'].min()
-                end_date = df['Date'].max()
-
-        date_range = (start_date.date(), end_date.date())
+        
+        # Time Filters
+        cf1, cf2, cf3 = st.columns([2, 1, 1])
+        with cf1:
+            date_range = st.slider("", 
+                min_value=df['Date'].min().date() if df['Date'].notna().any() else today.date(), 
+                max_value=df['Date'].max().date() if df['Date'].notna().any() else today.date(),
+                value=(start_date.date(), end_date.date()),
+                label_visibility="collapsed"
+            )
+        
         mask = (df['Date'].dt.date >= date_range[0]) & (df['Date'].dt.date <= date_range[1])
         df_chart = df.loc[mask].copy()
+    else:
+        df_chart = pd.DataFrame()
 
     tab_dash, tab_upload, tab_ledger = st.tabs(["📈 Analytics", "📤 Upload", "📝 Ledger"])
     
+    # 1. ANALYTICS
     with tab_dash:
-        if not df.empty and not df_chart.empty:
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Period Spend", f"{home_curr}{df_chart['Amount'].sum():.2f}")
-            c2.metric("Period Vices", f"{home_curr}{df_chart[df_chart['Is_Vice']]['Amount'].sum():.2f}")
-            c3.metric("Items", len(df_chart))
-
-            st.divider()
+        if not df_chart.empty:
+            # AI ADVISOR
             col_advice, col_btn = st.columns([4, 1])
             with col_btn:
                 if st.button("💡 Generate AI Insight"):
                     with st.spinner("Analyzing..."):
                         summary = df_chart.groupby('Category')['Amount'].sum().to_string()
                         sub_summary = df_chart.groupby('Sub_Category')['Amount'].sum().sort_values(ascending=False).head(5).to_string()
-                        vice_sum = df_chart[df_chart['Is_Vice']]['Amount'].sum()
-                        context = f"Total: {df_chart['Amount'].sum()}\nVices: {vice_sum}\nBreakdown:\n{summary}\nTop Items:\n{sub_summary}"
+                        context = f"Income: {net_monthly}\nTotal Spend: {df_chart['Amount'].sum()}\nBreakdown:\n{summary}\nTop Items:\n{sub_summary}"
+                        
                         api_key = st.secrets["GEMINI_API_KEY"]
                         st.session_state.ai_advice = AIEngine(api_key).generate_financial_advice(context)
             with col_advice:
-                if 'ai_advice' in st.session_state: st.success(st.session_state.ai_advice)
+                if 'ai_advice' in st.session_state: st.info(st.session_state.ai_advice)
 
             st.divider()
             domain = ["Groceries", "Alcohol", "Dining", "Transport", "Shopping", "Utilities", "Services", "Unknown"]
@@ -349,15 +436,16 @@ def dashboard_screen():
                 ).interactive()
                 st.altair_chart(deep_chart, use_container_width=True)
 
-            st.subheader("Vice Hunter")
-            vice_df = df_chart[df_chart['Is_Vice'] == True]
-            if not vice_df.empty:
-                v_summ = vice_df.groupby('Sub_Category')['Amount'].sum().reset_index()
-                vice_chart = alt.Chart(v_summ).mark_bar().encode(
-                    x=alt.X('Sub_Category', sort='-y'), y='Amount', color=alt.value('#e74c3c')
+            st.subheader("Spending Timeline")
+            # Only chart valid dates
+            df_valid = df_chart.dropna(subset=['Date'])
+            if not df_valid.empty:
+                line = alt.Chart(df_valid).mark_line(point=True).encode(
+                    x='Date', y='sum(Amount)', color='Category', tooltip=['Date', 'sum(Amount)']
                 ).interactive()
-                st.altair_chart(vice_chart, use_container_width=True)
+                st.altair_chart(line, use_container_width=True)
 
+    # 2. UPLOAD
     with tab_upload:
         uploaded = st.file_uploader("Upload Receipts", accept_multiple_files=True)
         if uploaded and st.button("🔍 Run Forensic Audit", type="primary"):
@@ -375,14 +463,13 @@ def dashboard_screen():
                     
                     items = []
                     if f.type != "application/pdf":
-                        status.write("  ↳ Quad Scan (Auto-Retry Enabled)...")
+                        status.write("  ↳ Quad Scan (High Res)...")
                         slices = smart_slice_image(tpath)
                         for idx, s in enumerate(slices):
                             _, buf = cv2.imencode(".jpg", s)
                             try:
                                 items.extend(ai.analyze_image_bytes(buf.tobytes(), "image/jpeg", vices, home_curr))
-                            except Exception as e:
-                                status.warning(f"    - Slice {idx+1} skipped (Error: {e})")
+                            except: continue
                     else:
                         with open(tpath, "rb") as pdf_file:
                             items.extend(ai.analyze_image_bytes(pdf_file.read(), "application/pdf", vices, home_curr))
@@ -391,7 +478,7 @@ def dashboard_screen():
                         status.warning("  ⚠️ No items found.")
                         continue
 
-                    # Grouping Logic
+                    # Grouping
                     receipt_groups = {}
                     for item in items:
                         rid = item.get('rid', 0)
@@ -441,6 +528,7 @@ def dashboard_screen():
                 st.success("Audit Saved!")
                 time.sleep(1); st.rerun()
 
+    # 3. LEDGER
     with tab_ledger:
         if not df.empty:
             col_f1, col_f2 = st.columns(2)
@@ -489,4 +577,4 @@ def dashboard_screen():
 
 if __name__ == "__main__":
     main()
-
+    
