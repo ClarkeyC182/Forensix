@@ -184,6 +184,7 @@ class DatabaseManager:
     def clear_user_data(self, username):
         conn = self._get_conn()
         conn.execute("DELETE FROM transactions WHERE username = ?", (username,))
+        # Also clear income? Usually users want to keep profile, but you asked to reset income too
         conn.execute("UPDATE users SET gross_income = 0 WHERE username = ?", (username,))
         conn.commit()
         conn.close()
@@ -285,7 +286,7 @@ class AIEngine:
         5. VICES: {user_vices}.
         6. CURRENCY: {currency}.
         """
-        # USE FLASH 2.0 (Newest) or 1.5 PRO
+        
         models_to_try = ["gemini-1.5-pro", "gemini-2.0-flash", "gemini-1.5-flash"]
         for model in models_to_try:
             try:
@@ -304,31 +305,18 @@ class AIEngine:
 
     def generate_financial_advice(self, summary_text):
         prompt = f"""
-        Act as a professional financial consultant.
-        Review this spending data.
-        Provide 3 specific, actionable tips to reduce 'Discretionary' (Vices) and Sub-Category spending.
-        Be direct.
+        You are a financial coach. 
+        Analyze this spending data summary.
+        Give 3 short, punchy, sometimes sarcastic/funny observations about their spending habits (Vices vs Essentials).
+        Output plain text.
         DATA: {summary_text}
         """
-        # FLASH IS BEST FOR TEXT GENERATION SPEED/RELIABILITY
-        models_to_try = ["gemini-1.5-flash", "gemini-1.5-pro"]
-        
-        for model in models_to_try:
-            try:
-                res = self.client.models.generate_content(model=model, contents=prompt)
-                return res.text
-            except Exception as e:
-                print(f"Advice Error {model}: {e}")
-                continue
-        
-        # LOCAL FALLBACK IF API FAILS
-        return f"""
-        **AI Connectivity Issue.**
-        Here is a rule-based analysis:
-        1. You have spent significantly on discretionary items. Review the 'Vice Hunter' chart.
-        2. Check your top Sub-Category. Is it a necessity?
-        3. Ensure all receipts are uploaded to get a full picture.
-        """
+        try:
+            # Using 1.5 Flash - Most stable for text generation
+            res = self.client.models.generate_content(model="gemini-1.5-flash", contents=prompt)
+            return res.text
+        except Exception as e:
+            return f"Error: {str(e)}"
 
 # --- APP LOGIC ---
 db = DatabaseManager(DB_PATH)
@@ -400,104 +388,129 @@ def dashboard_screen():
                 time.sleep(0.5); st.rerun()
         
         st.divider()
-        # VICES INPUT RESTORED
         vices_input = st.text_area("Vices (Keywords)", "alcohol, candy, betting", help="Separate by comma. The AI looks for these words.")
         
         if st.button("🗑️ Reset All Data"):
             db.clear_user_data(st.session_state.user)
-            st.success("All data (including income) cleared.")
+            st.success("Cleared!")
             time.sleep(1); st.rerun()
 
     st.title("📊 Forensic Dashboard")
     
-    # RELOAD DATA
-    df = db.get_user_data(st.session_state.user)
+    # 1. LOAD FULL DATA
+    df_full = db.get_user_data(st.session_state.user)
     
-    net_monthly = calculate_net_monthly(user_gross, user_freq, user_residency)
-    total_spend = df['Amount'].sum() if not df.empty else 0.0
-    vice_spend = df[df['Is_Vice']]['Amount'].sum() if not df.empty else 0.0
-    remaining = net_monthly - total_spend
+    # 2. FILTERING ENGINE (Centralized)
+    today = datetime.now()
+    start_date = df_full['Date'].min() if not df_full.empty and df_full['Date'].notna().any() else today
+    end_date = df_full['Date'].max() if not df_full.empty and df_full['Date'].notna().any() else today
     
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Net Monthly Income", f"{home_curr}{net_monthly:,.2f}")
-    c2.metric("Total Spend", f"{home_curr}{total_spend:,.2f}")
-    c3.metric("Remaining", f"{home_curr}{remaining:,.2f}", delta="Surplus" if remaining > 0 else "Deficit")
-    c4.metric("Vice Leakage", f"{home_curr}{vice_spend:,.2f}", delta="Waste", delta_color="inverse")
+    # Defaults
+    df_filtered = df_full.copy()
     
-    df_chart = pd.DataFrame()
-    if not df.empty:
-        today = datetime.now()
-        start_date = df['Date'].min() if df['Date'].notna().any() else today
-        end_date = df['Date'].max() if df['Date'].notna().any() else today
-        
-        with st.expander("🔎 Filter & Timeline Control", expanded=True):
+    if not df_full.empty:
+        with st.expander("🔎 Global Filter & Timeline (Controls Everything)", expanded=True):
             cf1, cf2 = st.columns([3, 1])
             with cf1:
                 date_range = st.slider("Time Range", 
-                    min_value=df['Date'].min().date() if df['Date'].notna().any() else today.date(), 
-                    max_value=df['Date'].max().date() if df['Date'].notna().any() else today.date(),
+                    min_value=df_full['Date'].min().date() if df_full['Date'].notna().any() else today.date(), 
+                    max_value=df_full['Date'].max().date() if df_full['Date'].notna().any() else today.date(),
                     value=(start_date.date(), end_date.date())
                 )
             with cf2:
                 st.write("") 
                 if st.button("Reset to All Time", use_container_width=True):
-                    date_range = (df['Date'].min().date(), df['Date'].max().date())
+                    st.rerun()
         
-        mask = (df['Date'].dt.date >= date_range[0]) & (df['Date'].dt.date <= date_range[1])
-        df_chart = df.loc[mask].copy()
+        # APPLY FILTER TO *EVERYTHING*
+        mask = (df_full['Date'].dt.date >= date_range[0]) & (df_full['Date'].dt.date <= date_range[1])
+        # IMPORTANT: If items have NO date, we usually exclude them from timeline filters to avoid errors, 
+        # BUT we must keep them accessible.
+        # Strategy: Keep valid dates in range OR keep null dates? 
+        # Usually standard is: Time filter hides nulls.
+        df_filtered = df_full.loc[mask].copy()
+
+    # 3. CALCULATE METRICS (Based on Filtered Data)
+    net_monthly = calculate_net_monthly(user_gross, user_freq, user_residency)
+    
+    # Adjust Income for Filter Duration? 
+    # No, keep Income as "Monthly Standard" but show Spend for "Selected Period"
+    
+    total_spend = df_filtered['Amount'].sum() if not df_filtered.empty else 0.0
+    vice_spend = df_filtered[df_filtered['Is_Vice']]['Amount'].sum() if not df_filtered.empty else 0.0
+    remaining = net_monthly - total_spend
+    
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Net Income (Monthly)", f"{home_curr}{net_monthly:,.2f}")
+    c2.metric("Filtered Spend", f"{home_curr}{total_spend:,.2f}")
+    c3.metric("Remaining", f"{home_curr}{remaining:,.2f}", delta="Surplus" if remaining > 0 else "Deficit")
+    c4.metric("Vice Leakage", f"{home_curr}{vice_spend:,.2f}", delta="Waste", delta_color="inverse")
 
     tab_dash, tab_upload, tab_ledger = st.tabs(["📈 Analytics", "📤 Upload", "📝 Ledger"])
     
     with tab_dash:
-        if not df_chart.empty:
+        if not df_filtered.empty:
             col_advice, col_btn = st.columns([4, 1])
             with col_btn:
                 if st.button("💡 Get AI Insight"):
                     with st.spinner("Analyzing..."):
-                        summary = df_chart.groupby('Category')['Amount'].sum().to_string()
-                        sub_summary = df_chart.groupby('Sub_Category')['Amount'].sum().sort_values(ascending=False).head(5).to_string()
-                        vice_sum = df_chart[df_chart['Is_Vice']]['Amount'].sum()
-                        context = f"Income: {net_monthly}\nTotal: {df_chart['Amount'].sum()}\nVices: {vice_sum}\nBreakdown:\n{summary}\nItems:\n{sub_summary}"
+                        summary = df_filtered.groupby('Category')['Amount'].sum().to_string()
+                        sub_summary = df_filtered.groupby('Sub_Category')['Amount'].sum().sort_values(ascending=False).head(5).to_string()
+                        vice_sum = df_filtered[df_filtered['Is_Vice']]['Amount'].sum()
+                        context = f"Income: {net_monthly}\nTotal: {total_spend}\nVices: {vice_sum}\nBreakdown:\n{summary}\nItems:\n{sub_summary}"
                         
                         api_key = st.secrets["GEMINI_API_KEY"]
                         st.session_state.ai_advice = AIEngine(api_key).generate_financial_advice(context)
             with col_advice:
-                if 'ai_advice' in st.session_state: st.info(st.session_state.ai_advice)
+                if 'ai_advice' in st.session_state: 
+                    # Check if error
+                    msg = st.session_state.ai_advice
+                    if "Error" in msg: st.error(msg)
+                    else: st.info(msg)
 
             st.divider()
-            
-            # --- CHARTS ---
             domain = ["Groceries", "Alcohol", "Dining", "Transport", "Shopping", "Utilities", "Services", "Unknown"]
             range_ = ["#2ecc71", "#9b59b6", "#e67e22", "#3498db", "#f1c40f", "#95a5a6", "#34495e", "#bdc3c7"]
             
             c1, c2 = st.columns(2)
             with c1:
                 st.subheader("Category Breakdown")
-                # Remove Nulls for cleaner chart
-                clean_chart_df = df_chart[df_chart['Category'].notna() & (df_chart['Category'] != '')]
-                chart = alt.Chart(clean_chart_df).mark_bar().encode(
+                # Drop null categories for cleaner chart
+                clean_df = df_filtered[df_filtered['Category'].notna() & (df_filtered['Category'] != "")]
+                chart = alt.Chart(clean_df).mark_bar().encode(
                     x=alt.X('Category', sort='-y'), y='Amount', color=alt.Color('Category', scale=alt.Scale(domain=domain, range=range_))
                 ).interactive()
                 st.altair_chart(chart, use_container_width=True)
             with c2:
                 st.subheader("Top Sub-Categories")
-                df_deep = df_chart.groupby('Sub_Category')['Amount'].sum().reset_index().sort_values('Amount', ascending=False).head(10)
+                df_deep = df_filtered.groupby('Sub_Category')['Amount'].sum().reset_index().sort_values('Amount', ascending=False).head(10)
                 deep_chart = alt.Chart(df_deep).mark_bar().encode(
                     y=alt.Y('Sub_Category', sort='-x'), x='Amount', color=alt.value('#3498db'), tooltip=['Sub_Category', 'Amount']
                 ).interactive()
                 st.altair_chart(deep_chart, use_container_width=True)
 
-            st.subheader("Vice Hunter")
-            vice_df = df_chart[df_chart['Is_Vice'] == True]
-            if not vice_df.empty:
-                base = alt.Chart(vice_df).encode(theta=alt.Theta("Amount", stack=True))
-                pie = base.mark_arc(outerRadius=100).encode(
-                    color=alt.Color("Sub_Category"), 
-                    tooltip=["Sub_Category", "Amount"]
-                )
-                st.altair_chart(pie, use_container_width=True)
-            else:
-                st.success("No Vices Found! (Or none scanned yet)")
+            r2c1, r2c2 = st.columns(2)
+            with r2c1:
+                st.subheader("Vice Hunter")
+                vice_df = df_filtered[df_filtered['Is_Vice'] == True]
+                if not vice_df.empty:
+                    base = alt.Chart(vice_df).encode(theta=alt.Theta("Amount", stack=True))
+                    pie = base.mark_arc(outerRadius=100).encode(
+                        color=alt.Color("Sub_Category"), 
+                        tooltip=["Sub_Category", "Amount"]
+                    )
+                    st.altair_chart(pie, use_container_width=True)
+                else: st.success("No Vices Found!")
+            
+            with r2c2:
+                st.subheader("Spending Timeline")
+                # Group by Day or Week? Let's do Day for clarity
+                df_time = df_filtered.dropna(subset=['Date'])
+                if not df_time.empty:
+                    line = alt.Chart(df_time).mark_line(point=True).encode(
+                        x='Date', y='sum(Amount)', color='Category', tooltip=['Date', 'sum(Amount)']
+                    ).interactive()
+                    st.altair_chart(line, use_container_width=True)
 
     with tab_upload:
         uploaded = st.file_uploader("Upload Receipts", accept_multiple_files=True)
@@ -566,46 +579,35 @@ def dashboard_screen():
                 time.sleep(1); st.rerun()
 
     with tab_ledger:
-        if not df.empty:
-            # --- SUPERCHARGED FILTER BAR (EXCEL STYLE) ---
-            with st.container(border=True):
-                st.markdown("#### 🌪️ Excel Filters")
-                col_f1, col_f2, col_f3, col_f4 = st.columns(4)
+        if not df_full.empty:
+            # --- ADVANCED QUERY TOOL ---
+            with st.expander("🛠️ Advanced Query Tool (Filter)", expanded=False):
+                c_f1, c_f2, c_f3 = st.columns(3)
                 
-                # 1. TEXT SEARCH (Global)
-                search_term = col_f1.text_input("Search Text", placeholder="Search anything...")
+                # 1. SEARCH
+                search_txt = c_f1.text_input("Search Text", placeholder="Tesco, Wine...")
                 
-                # 2. VENDOR (Dropdown)
-                all_vendors = ["All"] + sorted(list(df['Vendor'].dropna().unique()))
-                sel_vend = col_f2.multiselect("Vendor", all_vendors, default=[])
+                # 2. DROPDOWNS
+                f_cats = c_f2.multiselect("Categories", df_full['Category'].unique())
                 
-                # 3. CATEGORY (Dropdown)
-                all_cats = ["All"] + sorted(list(df['Category'].dropna().unique()))
-                sel_cat = col_f3.multiselect("Category", all_cats, default=[])
+                # 3. TOGGLES
+                show_missing = c_f3.checkbox("Show Missing Dates Only")
                 
-                # 4. SORT BY
-                sort_col = col_f4.selectbox("Sort By", ["Date (Newest)", "Date (Oldest)", "Amount (High)", "Amount (Low)", "Vendor (A-Z)"])
-            
-            # APPLY FILTERS
-            df_view = df.copy()
-            if search_term:
-                df_view = df_view[df_view.astype(str).apply(lambda x: x.str.contains(search_term, case=False)).any(axis=1)]
-            if sel_vend and "All" not in sel_vend:
-                df_view = df_view[df_view['Vendor'].isin(sel_vend)]
-            if sel_cat and "All" not in sel_cat:
-                df_view = df_view[df_view['Category'].isin(sel_cat)]
-                
-            # APPLY SORT
-            if "Newest" in sort_col: df_view = df_view.sort_values("Date", ascending=False)
-            elif "Oldest" in sort_col: df_view = df_view.sort_values("Date", ascending=True)
-            elif "High" in sort_col: df_view = df_view.sort_values("Amount", ascending=False)
-            elif "Low" in sort_col: df_view = df_view.sort_values("Amount", ascending=True)
-            elif "Vendor" in sort_col: df_view = df_view.sort_values("Vendor", ascending=True)
+            # APPLY TO VIEW
+            df_view = df_filtered.copy() # Start with time-filtered data
+            if search_txt:
+                mask = df_view.astype(str).apply(lambda x: x.str.contains(search_txt, case=False)).any(axis=1)
+                df_view = df_view[mask]
+            if f_cats:
+                df_view = df_view[df_view['Category'].isin(f_cats)]
+            if show_missing:
+                df_view = df_view[df_view['Date'].isna()]
             
             # Select Column
             df_view.insert(0, "Select", False)
             
-            # RENDER GRID
+            st.caption(f"Showing {len(df_view)} rows.")
+            
             edited_df = st.data_editor(
                 df_view, 
                 num_rows="dynamic", 
@@ -614,7 +616,7 @@ def dashboard_screen():
                 column_config={
                     "Select": st.column_config.CheckboxColumn("✅", width="small"),
                     "id": None,
-                    "Date": st.column_config.DateColumn("Date", format="YYYY-MM-DD"),
+                    "Date": st.column_config.DateColumn("Date", format="YYYY-MM-DD", required=False),
                     "Amount": st.column_config.NumberColumn("Amount", format="%.2f"),
                 }
             )
@@ -622,7 +624,7 @@ def dashboard_screen():
             # BULK ACTIONS
             selected_ids = edited_df[edited_df['Select'] == True]['id'].astype(str).tolist()
             if selected_ids:
-                st.success(f"⚡ {len(selected_ids)} rows selected")
+                st.info(f"⚡ {len(selected_ids)} rows selected")
                 b1, b2, b3 = st.columns(3)
                 with b1:
                     bd = st.date_input("Bulk Date", value=None)
@@ -642,7 +644,7 @@ def dashboard_screen():
                         conn.commit(); conn.close()
                         st.rerun()
 
-            if st.button("💾 Save Grid Changes"):
+            if st.button("💾 Save All Grid Edits"):
                 conn = db._get_conn()
                 for i, row in edited_df.iterrows():
                     d_val = row['Date'].strftime('%Y-%m-%d') if pd.notnull(row['Date']) else None
@@ -657,3 +659,4 @@ def dashboard_screen():
 
 if __name__ == "__main__":
     main()
+
