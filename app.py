@@ -86,8 +86,15 @@ class DatabaseManager:
 
     def add_transactions(self, username, df):
         conn = self._get_conn()
+        df = df.copy()
         df['username'] = username
         df['is_vice'] = df['Is_Vice'].astype(int) 
+        
+        # STRICT DATE SAVING: Convert to string YYYY-MM-DD to allow SQLite storage
+        # This prevents the "Object" error later
+        if not df['Date'].empty:
+             df['Date'] = pd.to_datetime(df['Date']).dt.strftime('%Y-%m-%d')
+
         df_sql = df.rename(columns={
             "Date": "date", "Vendor": "vendor", "Item": "item", 
             "Amount": "amount", "Currency": "currency", "IVA": "iva",
@@ -102,6 +109,7 @@ class DatabaseManager:
         conn = self._get_conn()
         df = pd.read_sql_query("SELECT * FROM transactions WHERE username = ?", conn, params=(username,))
         conn.close()
+        
         if df.empty: return pd.DataFrame(columns=REQUIRED_COLS)
         
         df = df.rename(columns={
@@ -110,8 +118,15 @@ class DatabaseManager:
             "category": "Category", "sub_category": "Sub_Category", 
             "is_vice": "Is_Vice", "file_name": "File"
         })
+        
         df['Is_Vice'] = df['Is_Vice'].astype(bool)
-        df['Date'] = pd.to_datetime(df['Date'])
+        
+        # CRITICAL FIX: Safe Date Loading
+        # 'coerce' turns garbage dates into NaT (Not a Time) instead of Crashing
+        df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+        # Fill any failures with Today to keep the app running
+        df['Date'] = df['Date'].fillna(pd.Timestamp.now())
+        
         return df
 
     def clear_user_data(self, username):
@@ -133,6 +148,7 @@ def safe_date(val):
         if s in ['none', 'null', 'nan', '', 'yyyy-mm-dd', 'unknown']: return pd.Timestamp.now()
         dt = pd.to_datetime(val, errors='coerce', dayfirst=True)
         if pd.isna(dt): return pd.Timestamp.now()
+        
         now = pd.Timestamp.now()
         if dt > now: return now 
         if dt.year < 2020: return now
@@ -161,16 +177,6 @@ class AIEngine:
     def __init__(self, api_key):
         self.client = genai.Client(api_key=api_key) if api_key else None
 
-    def list_available_models(self):
-        """Debug tool to see what models the API Key can access."""
-        if not self.client: return []
-        try:
-            # This is a generic call to list models, syntax depends on specific library version
-            # For google-genai, we often just try known models.
-            # But let's return a hardcoded list of known stable ones to try.
-            return ["gemini-1.5-pro", "gemini-2.0-flash", "gemini-1.5-flash"]
-        except: return []
-
     def analyze_image(self, image_path, mime_type, user_vices, currency):
         if not self.client: raise ValueError("No API Key")
         with open(image_path, "rb") as f: content = f.read()
@@ -187,11 +193,11 @@ class AIEngine:
         5. CURRENCY: {currency}.
         """
         
-        # STABLE MODEL LIST (Prioritizing Pro, then falling back)
+        # PRIORITY: 1.5 Pro -> 2.0 Flash -> 1.5 Flash
         models_to_try = [
-            "gemini-1.5-pro",        # The "Smartest" Stable Model
-            "gemini-2.0-flash",      # The "Newest" Fast Model
-            "gemini-1.5-flash"       # The "Reliable" Backup
+            "gemini-1.5-pro",
+            "gemini-2.0-flash", 
+            "gemini-1.5-flash"
         ]
         
         last_error = None
@@ -205,12 +211,10 @@ class AIEngine:
                 )
                 return clean_json_response(res.text)
             except Exception as e:
-                # If 404 (Not Found) or 429 (Quota), just move to next model
                 last_error = e
-                print(f"Model {model_name} failed: {e}")
+                # print(f"Model {model_name} failed: {e}") # Log internally
                 continue 
         
-        # If all fail
         raise last_error
 
 # --- APP LOGIC ---
@@ -244,7 +248,6 @@ def login_screen():
                 new_pass = st.text_input("New Password", type="password")
                 if st.form_submit_button("Create Account", use_container_width=True):
                     if db.create_user(new_user, new_pass):
-                        # AUTO-LOGIN
                         st.session_state.user = new_user
                         st.success("Account created! Logging in...")
                         time.sleep(0.5)
@@ -265,15 +268,19 @@ def dashboard_screen():
         vices = st.text_area("Vices", "alcohol, candy, betting")
         
         st.divider()
-        if st.button("🔍 Check AI Access"):
-            st.info("Your API Key will try these models in order:\n1. gemini-1.5-pro\n2. gemini-2.0-flash\n3. gemini-1.5-flash")
-            
         if st.button("🗑️ Clear My Data"):
             db.clear_user_data(st.session_state.user)
             st.rerun()
 
     st.title("📊 Forensic Dashboard")
-    df = db.get_user_data(st.session_state.user)
+    
+    # Safe Load
+    try:
+        df = db.get_user_data(st.session_state.user)
+    except Exception as e:
+        st.error("⚠️ Database error detected. Clearing corrupted data...")
+        db.clear_user_data(st.session_state.user)
+        st.rerun()
     
     if not df.empty:
         c1, c2, c3 = st.columns(3)
@@ -306,7 +313,7 @@ def dashboard_screen():
                     
                     if f.type != "application/pdf": resize_image_force(tpath)
                     
-                    status_box.write(f"  ↳ Connecting to Gemini Pro (Auto-Switching if busy)...")
+                    status_box.write(f"  ↳ Scanning... (Using most powerful available model)")
                     mime = "application/pdf" if f.type == "application/pdf" else "image/jpeg"
                     
                     items = ai.analyze_image(tpath, mime, vices, home_curr)
@@ -394,4 +401,4 @@ def dashboard_screen():
 
 if __name__ == "__main__":
     main()
-
+    
