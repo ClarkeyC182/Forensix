@@ -101,19 +101,21 @@ class DatabaseManager:
         df_sql[cols].to_sql("transactions", conn, if_exists="append", index=False)
         conn.close()
 
-    def update_transaction_field(self, username, field, new_value, filter_col=None, filter_val=None):
-        """Surgical Bulk Update"""
+    def update_transaction_field_safe(self, username, field, new_value, filter_col, filter_val, only_nulls=False):
+        """Surgical Bulk Update - SAFE MODE"""
         conn = self._get_conn()
-        query = f"UPDATE transactions SET {field} = ? WHERE username = ?"
-        params = [new_value, username]
+        query = f"UPDATE transactions SET {field} = ? WHERE username = ? AND {filter_col} = ?"
         
-        if filter_col and filter_val:
-            query += f" AND {filter_col} = ?"
-            params.append(filter_val)
+        if only_nulls:
+            query += f" AND ({field} IS NULL OR {field} = '')"
             
-        conn.execute(query, params)
+        params = [new_value, username, filter_val]
+        
+        cursor = conn.execute(query, params)
+        rows_affected = cursor.rowcount
         conn.commit()
         conn.close()
+        return rows_affected
 
     def get_user_data(self, username):
         conn = self._get_conn()
@@ -187,14 +189,13 @@ class AIEngine:
     def analyze_image_bytes(self, image_bytes, mime_type, user_vices, currency):
         if not self.client: raise ValueError("No API Key")
         
-        # IMPROVED PROMPT: ASKS FOR RECEIPT GROUPING ID
         prompt = f"""
         Role: Senior Forensic Auditor.
         Task: OCR transaction lines.
         JSON: [{{ "rid": 1, "d": "DD/MM/YYYY", "v": "Vendor", "n": "Item Name", "p": 1.00, "c": "£", "mc": "Category", "sc": "SubCategory", "vice": false }}]
         RULES:
-        1. **GROUPING:** Assign a 'rid' (Receipt ID: 1, 2, 3) to items. Items from the same physical receipt MUST have the same 'rid'.
-        2. SCAN ALL visible items.
+        1. **GROUPING:** Assign 'rid' (1, 2, 3...) to group items by physical receipt.
+        2. **SUB-CATEGORY:** BE SPECIFIC (e.g. 'Cheese', 'Wine', 'Fuel', 'Toys', 'Parking').
         3. VENDOR: If header missing, use 'CONT'.
         4. CATEGORY: [Groceries, Alcohol, Dining, Transport, Shopping, Utilities, Services].
         5. VICES: {user_vices}.
@@ -212,6 +213,21 @@ class AIEngine:
                 return clean_json_response(res.text)
             except: continue
         raise Exception("All AI models failed.")
+
+    def generate_financial_advice(self, summary_text):
+        """Generates the 'Roast' / Advice"""
+        prompt = f"""
+        Act as a high-end personal finance consultant.
+        Analyze this spending summary and give 3 bullet points of specific, actionable advice.
+        Be direct but professional. If they are spending too much on vices or specific sub-categories, point it out.
+        
+        DATA:
+        {summary_text}
+        """
+        try:
+            res = self.client.models.generate_content(model="gemini-1.5-pro", contents=prompt)
+            return res.text
+        except: return "Could not generate advice right now."
 
 # --- APP LOGIC ---
 db = DatabaseManager(DB_PATH)
@@ -256,27 +272,26 @@ def dashboard_screen():
         
         st.divider()
         
-        # --- SMART FIXER (BULK EDIT) ---
+        # --- SMART FIXER V2 (SAFE MODE) ---
         st.subheader("🛠️ Smart Fixer")
         
-        # 1. Vendor Cleaner
+        # Vendor Selector
         vendors = list(df['Vendor'].unique()) if not df.empty else []
-        target_v = st.selectbox("Fix items from Vendor:", ["(Select Vendor)"] + vendors)
+        target_v = st.selectbox("Select Vendor:", ["(Select)"] + vendors)
         
-        if target_v != "(Select Vendor)":
-            # Action A: Rename Vendor
-            new_name = st.text_input("Rename Vendor to:", value=target_v)
-            if new_name != target_v and st.button("Apply Rename"):
-                db.update_transaction_field(st.session_state.user, "vendor", new_name, "vendor", target_v)
-                st.success("Renamed!")
-                time.sleep(0.5); st.rerun()
+        if target_v != "(Select)":
+            # Count Missing Dates for this Vendor
+            missing_for_v = df[(df['Vendor'] == target_v) & (df['Date'].isna())].shape[0]
             
-            # Action B: Bulk Date Set
-            new_date = st.date_input("Set Date for this Vendor:", value=None)
-            if st.button(f"Apply Date to all {target_v}"):
-                db.update_transaction_field(st.session_state.user, "date", new_date.strftime('%Y-%m-%d'), "vendor", target_v)
-                st.success("Dates Updated!")
-                time.sleep(0.5); st.rerun()
+            new_date = st.date_input("Set Missing Dates To:", value=None)
+            
+            if st.button(f"Apply to {missing_for_v} missing items"):
+                if missing_for_v > 0:
+                    count = db.update_transaction_field_safe(st.session_state.user, "date", new_date.strftime('%Y-%m-%d'), "vendor", target_v, only_nulls=True)
+                    st.success(f"Fixed {count} items!")
+                    time.sleep(0.5); st.rerun()
+                else:
+                    st.info("No missing dates for this vendor!")
 
         st.divider()
         residency = st.selectbox("Residency", ["UK (GBP)", "Spain (EUR)"])
@@ -288,15 +303,14 @@ def dashboard_screen():
 
     st.title("📊 Forensic Dashboard")
     
-    # METRICS
     if not df.empty:
         c1, c2, c3 = st.columns(3)
         c1.metric("Total Spend", f"{home_curr}{df['Amount'].sum():.2f}")
         c2.metric("Vice Leakage", f"{home_curr}{df[df['Is_Vice']]['Amount'].sum():.2f}")
         missing = df['Date'].isna().sum()
-        c3.metric("Action Needed", f"{missing} Missing Dates", delta="Fix in Sidebar" if missing > 0 else "Clean", delta_color="inverse")
+        c3.metric("Action Needed", f"{missing} Missing Dates", delta="Check Sidebar" if missing > 0 else "All Good", delta_color="inverse")
     
-    tab_dash, tab_upload, tab_ledger = st.tabs(["📈 Analytics", "📤 Upload", "📝 Ledger"])
+    tab_dash, tab_upload, tab_ledger = st.tabs(["📈 Executive Analytics", "📤 Upload", "📝 Ledger"])
     
     with tab_upload:
         uploaded = st.file_uploader("Upload Receipts", accept_multiple_files=True)
@@ -304,7 +318,6 @@ def dashboard_screen():
             api_key = st.secrets["GEMINI_API_KEY"]
             ai = AIEngine(api_key)
             all_rows = []
-            
             status = st.status("Forensic Audit Running...", expanded=True)
             prog = st.progress(0)
             
@@ -316,7 +329,7 @@ def dashboard_screen():
                     
                     items = []
                     if f.type != "application/pdf":
-                        status.write("  ↳ Quad Scan (High Res)...")
+                        status.write("  ↳ High-Res Quad Scan...")
                         slices = smart_slice_image(tpath)
                         for s in slices:
                             _, buf = cv2.imencode(".jpg", s)
@@ -325,21 +338,13 @@ def dashboard_screen():
                         with open(tpath, "rb") as pdf_file:
                             items.extend(ai.analyze_image_bytes(pdf_file.read(), "application/pdf", vices, home_curr))
                     
-                    # SMART GROUPING LOGIC
-                    # 1. Group items by 'rid' (Receipt ID) returned by AI
-                    # 2. Find date for that group
-                    # 3. Apply to siblings
-                    
-                    # Organize by RID
                     receipt_groups = {}
                     for item in items:
                         rid = item.get('rid', 0)
                         if rid not in receipt_groups: receipt_groups[rid] = []
                         receipt_groups[rid].append(item)
                         
-                    # Process Groups
                     for rid, group_items in receipt_groups.items():
-                        # Find group date
                         group_date = None
                         for item in group_items:
                             d = safe_date(item.get("d"))
@@ -347,7 +352,6 @@ def dashboard_screen():
                                 group_date = d
                                 break
                         
-                        # Apply
                         for item in group_items:
                             name = str(item.get("n", "Item"))
                             if any(x in name.lower() for x in ["total", "subtotal", "balance"]): continue
@@ -371,7 +375,6 @@ def dashboard_screen():
                                 "Is_Vice": bool(item.get("vice", False)),
                                 "File": f.name
                             })
-
                 except Exception as e:
                     status.error(f"Error: {e}")
                 finally:
@@ -386,12 +389,36 @@ def dashboard_screen():
 
     with tab_dash:
         if not df.empty:
+            # AI ADVISOR SECTION
+            st.divider()
+            col_advice, col_btn = st.columns([4, 1])
+            with col_btn:
+                if st.button("💡 Generate AI Insight"):
+                    with st.spinner("Analyzing spending habits..."):
+                        # Prepare summary text
+                        summary = df.groupby('Category')['Amount'].sum().to_string()
+                        sub_summary = df.groupby('Sub_Category')['Amount'].sum().sort_values(ascending=False).head(5).to_string()
+                        vice_sum = df[df['Is_Vice']]['Amount'].sum()
+                        
+                        full_context = f"Total Spend: {df['Amount'].sum()}\nVice Spend: {vice_sum}\n\nCategory Breakdown:\n{summary}\n\nTop Specific Items:\n{sub_summary}"
+                        
+                        api_key = st.secrets["GEMINI_API_KEY"]
+                        advice = AIEngine(api_key).generate_financial_advice(full_context)
+                        st.session_state.ai_advice = advice
+            
+            with col_advice:
+                if 'ai_advice' in st.session_state:
+                    st.info(st.session_state.ai_advice)
+            
+            st.divider()
+
+            # VISUALS
             domain = ["Groceries", "Alcohol", "Dining", "Transport", "Shopping", "Utilities", "Services", "Unknown"]
             range_ = ["#2ecc71", "#9b59b6", "#e67e22", "#3498db", "#f1c40f", "#95a5a6", "#34495e", "#bdc3c7"]
             
             c1, c2 = st.columns(2)
             with c1:
-                st.subheader("💸 Categories")
+                st.subheader("💸 Category Breakdown")
                 chart = alt.Chart(df).mark_bar().encode(
                     x=alt.X('Category', sort='-y'), y='Amount', 
                     color=alt.Color('Category', scale=alt.Scale(domain=domain, range=range_)),
@@ -400,8 +427,8 @@ def dashboard_screen():
                 st.altair_chart(chart, use_container_width=True)
             
             with c2:
-                # SUB-CATEGORY DEEP DIVE (RESTORED)
-                st.subheader("🔬 Top Items (Deep Dive)")
+                # SUB-CATEGORY DEEP DIVE
+                st.subheader("🔬 Deep Dive (Sub-Categories)")
                 df_deep = df.groupby('Sub_Category')['Amount'].sum().reset_index().sort_values('Amount', ascending=False).head(10)
                 deep_chart = alt.Chart(df_deep).mark_bar().encode(
                     y=alt.Y('Sub_Category', sort='-x'),
@@ -421,9 +448,15 @@ def dashboard_screen():
 
     with tab_ledger:
         if not df.empty:
-            st.info("💡 Use 'Smart Fixer' in sidebar to bulk-edit Dates or Rename Vendors.")
+            # FILTER: MISSING DATES
+            show_missing = st.checkbox("⚠️ Show only items with Missing Dates")
+            
+            df_view = df.copy()
+            if show_missing:
+                df_view = df[df['Date'].isna()]
+            
             edited_df = st.data_editor(
-                df, 
+                df_view, 
                 num_rows="dynamic", 
                 use_container_width=True,
                 column_config={
@@ -432,12 +465,20 @@ def dashboard_screen():
                     "Category": st.column_config.SelectboxColumn("Category", options=["Groceries", "Alcohol", "Dining", "Transport", "Shopping", "Utilities", "Services"])
                 }
             )
+            
+            # Logic to merge edits back into main DF (if filtering)
             if st.button("💾 Save Changes"):
-                db.clear_user_data(st.session_state.user)
-                db.add_transactions(st.session_state.user, edited_df)
-                st.success("Saved!")
-                st.rerun()
+                if show_missing:
+                    # Partial update logic would be complex here for MVP
+                    # For safety, we just re-save what is visible if it's the whole table
+                    # Or simpler: Instruct user to uncheck filter before saving in MVP
+                    st.warning("Please uncheck filter before saving (Safety Feature).")
+                else:
+                    db.clear_user_data(st.session_state.user)
+                    db.add_transactions(st.session_state.user, edited_df)
+                    st.success("Saved!")
+                    st.rerun()
 
 if __name__ == "__main__":
     main()
-
+    
