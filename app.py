@@ -31,6 +31,7 @@ class DatabaseManager:
     def __init__(self, db_path):
         self.db_path = str(db_path)
         self._init_db()
+        self._migrate_db() # Run auto-migration
 
     def _get_conn(self):
         return sqlite3.connect(self.db_path, check_same_thread=False)
@@ -38,6 +39,7 @@ class DatabaseManager:
     def _init_db(self):
         conn = self._get_conn()
         c = conn.cursor()
+        # Users Table
         c.execute('''CREATE TABLE IF NOT EXISTS users (
             username TEXT PRIMARY KEY,
             password_hash TEXT NOT NULL,
@@ -46,6 +48,7 @@ class DatabaseManager:
             tax_residency TEXT DEFAULT 'UK',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )''')
+        # Transactions Table
         c.execute('''CREATE TABLE IF NOT EXISTS transactions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT,
@@ -63,6 +66,22 @@ class DatabaseManager:
         )''')
         conn.commit()
         conn.close()
+
+    def _migrate_db(self):
+        """Self-Healing: Adds missing columns to old databases"""
+        conn = self._get_conn()
+        c = conn.cursor()
+        try:
+            # Check if 'gross_income' exists
+            c.execute("SELECT gross_income FROM users LIMIT 1")
+        except sqlite3.OperationalError:
+            # Column missing, add it
+            c.execute("ALTER TABLE users ADD COLUMN gross_income REAL DEFAULT 0")
+            c.execute("ALTER TABLE users ADD COLUMN tax_residency TEXT DEFAULT 'UK'")
+            c.execute("ALTER TABLE users ADD COLUMN currency TEXT DEFAULT '£'")
+            conn.commit()
+        finally:
+            conn.close()
 
     def create_user(self, username, password):
         conn = self._get_conn()
@@ -159,37 +178,27 @@ class DatabaseManager:
 def calculate_net_monthly(gross, residency):
     net = 0.0
     if "UK" in residency:
-        # UK 2024/25 Bands
         allowance = 12570
         if gross > 100000: allowance = max(0, allowance - (gross - 100000) / 2)
         taxable = max(0, gross - allowance)
-        
         tax = 0.0
         if taxable > 0: tax += min(taxable, 37700) * 0.20
         if taxable > 37700: tax += min(taxable - 37700, 125140 - 37700) * 0.40
         if taxable > 125140: tax += (taxable - 125140) * 0.45
-        
         ni = 0.0
         if gross > 12570: ni += min(max(0, gross - 12570), 50270 - 12570) * 0.08
         if gross > 50270: ni += (gross - 50270) * 0.02
-        
         net = gross - tax - ni
     elif "Spain" in residency:
-        # Rough Spain IRPF (varies by region, this is a national approx)
         ss = min(gross, 56646) * 0.0635
         base = gross - ss - 2000
         irpf, prev = 0.0, 0
         bands = [(12450, 0.19), (20200, 0.24), (35200, 0.30), (60000, 0.37), (300000, 0.45)]
         for lim, rate in bands:
-            if base > prev: 
-                irpf += (min(base, lim) - prev) * rate
-                prev = lim
+            if base > prev: irpf += (min(base, lim) - prev) * rate; prev = lim
             else: break
         net = gross - ss - irpf
-    else:
-        # Generic Estimator (25% tax)
-        net = gross * 0.75
-        
+    else: net = gross * 0.75
     return net / 12
 
 # --- UTILS ---
@@ -254,7 +263,6 @@ class AIEngine:
         6. CURRENCY: {currency}.
         """
         
-        # MODEL DAISY CHAIN
         models_to_try = ["gemini-1.5-pro", "gemini-2.0-flash", "gemini-1.5-flash"]
         for model in models_to_try:
             try:
@@ -265,33 +273,28 @@ class AIEngine:
                 )
                 return clean_json_response(res.text)
             except Exception as e:
-                if "429" in str(e): # Rate Limit
+                if "429" in str(e): 
                     time.sleep(2)
                     continue
-                continue # Try next model
+                continue 
         raise Exception("All AI models failed.")
 
     def generate_financial_advice(self, summary_text):
         prompt = f"""
-        Act as a "Forensic Accountant" for a wealthy client.
-        Analyze this spending summary. 
-        Focus on:
-        1. **Vice Leakage** (Where are they wasting money?)
-        2. **Spending Velocity** (Are they buying too much random stuff?)
-        3. **Sub-Category patterns** (e.g. Too much Cheese or Wine?)
-        
-        Output: 3 short, punchy, insightful bullet points. Be direct.
-        
+        Act as a friendly financial coach.
+        Review this spending data.
+        Give 3 short, specific tips.
+        Focus on 'Discretionary' (Vices) and Sub-Category trends.
         DATA: {summary_text}
         """
-        # DAISY CHAIN FOR ADVICE TOO
-        models_to_try = ["gemini-1.5-pro", "gemini-2.0-flash", "gemini-1.5-flash"]
+        # USE STABLE MODEL FOR ADVICE (Less prone to 404 on 'Pro')
+        models_to_try = ["gemini-1.5-flash", "gemini-1.5-pro"]
         for model in models_to_try:
             try:
                 res = self.client.models.generate_content(model=model, contents=prompt)
                 return res.text
             except: continue
-        return "⚠️ AI Advice Unavailable (API Busy)"
+        return "⚠️ AI Advice Unavailable (API Error)"
 
 # --- APP LOGIC ---
 db = DatabaseManager(DB_PATH)
@@ -326,11 +329,9 @@ def login_screen():
                     else: st.error("Taken")
 
 def dashboard_screen():
-    # Load User & Profile
     df = db.get_user_data(st.session_state.user)
     profile = db.get_user_profile(st.session_state.user)
     
-    # Defaults
     home_curr = profile.get('currency', '£')
     user_residency = profile.get('tax_residency', 'UK')
     user_gross = profile.get('gross_income', 0.0)
@@ -343,13 +344,10 @@ def dashboard_screen():
         
         st.divider()
         st.subheader("💰 Financial Profile")
-        
-        # Profile Editor
         with st.form("profile_form"):
             new_residency = st.selectbox("Residency", ["UK (GBP)", "Spain (EUR)", "Other (USD)"], 
                                          index=0 if "UK" in user_residency else 1 if "Spain" in user_residency else 2)
             new_gross = st.number_input("Annual Gross Income", value=float(user_gross), step=1000.0)
-            
             if st.form_submit_button("Update Profile"):
                 curr = "£" if "UK" in new_residency else "€" if "Spain" in new_residency else "$"
                 db.update_user_profile(st.session_state.user, new_gross, new_residency, curr)
@@ -364,26 +362,22 @@ def dashboard_screen():
 
     st.title("📊 Forensic Dashboard")
     
-    # CALCULATE FINANCIALS
     net_monthly = calculate_net_monthly(user_gross, user_residency)
     total_spend = df['Amount'].sum() if not df.empty else 0.0
     vice_spend = df[df['Is_Vice']]['Amount'].sum() if not df.empty else 0.0
     remaining = net_monthly - total_spend
     
-    # TOP METRICS ROW
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Net Monthly Income", f"{home_curr}{net_monthly:,.2f}")
+    c1.metric("Net Monthly", f"{home_curr}{net_monthly:,.2f}")
     c2.metric("Total Spend", f"{home_curr}{total_spend:,.2f}")
     c3.metric("Remaining", f"{home_curr}{remaining:,.2f}", delta="Surplus" if remaining > 0 else "Deficit")
     c4.metric("Vice Leakage", f"{home_curr}{vice_spend:,.2f}", delta="Waste", delta_color="inverse")
     
-    # FILTER BAR
     if not df.empty:
         today = datetime.now()
         start_date = df['Date'].min() if df['Date'].notna().any() else today
         end_date = df['Date'].max() if df['Date'].notna().any() else today
         
-        # Time Filters
         cf1, cf2, cf3 = st.columns([2, 1, 1])
         with cf1:
             date_range = st.slider("", 
@@ -400,17 +394,16 @@ def dashboard_screen():
 
     tab_dash, tab_upload, tab_ledger = st.tabs(["📈 Analytics", "📤 Upload", "📝 Ledger"])
     
-    # 1. ANALYTICS
     with tab_dash:
         if not df_chart.empty:
-            # AI ADVISOR
             col_advice, col_btn = st.columns([4, 1])
             with col_btn:
                 if st.button("💡 Generate AI Insight"):
                     with st.spinner("Analyzing..."):
                         summary = df_chart.groupby('Category')['Amount'].sum().to_string()
                         sub_summary = df_chart.groupby('Sub_Category')['Amount'].sum().sort_values(ascending=False).head(5).to_string()
-                        context = f"Income: {net_monthly}\nTotal Spend: {df_chart['Amount'].sum()}\nBreakdown:\n{summary}\nTop Items:\n{sub_summary}"
+                        vice_sum = df_chart[df_chart['Is_Vice']]['Amount'].sum()
+                        context = f"Income: {net_monthly}\nTotal Spend: {df_chart['Amount'].sum()}\nVices: {vice_sum}\nBreakdown:\n{summary}\nTop Items:\n{sub_summary}"
                         
                         api_key = st.secrets["GEMINI_API_KEY"]
                         st.session_state.ai_advice = AIEngine(api_key).generate_financial_advice(context)
@@ -437,7 +430,6 @@ def dashboard_screen():
                 st.altair_chart(deep_chart, use_container_width=True)
 
             st.subheader("Spending Timeline")
-            # Only chart valid dates
             df_valid = df_chart.dropna(subset=['Date'])
             if not df_valid.empty:
                 line = alt.Chart(df_valid).mark_line(point=True).encode(
@@ -445,7 +437,6 @@ def dashboard_screen():
                 ).interactive()
                 st.altair_chart(line, use_container_width=True)
 
-    # 2. UPLOAD
     with tab_upload:
         uploaded = st.file_uploader("Upload Receipts", accept_multiple_files=True)
         if uploaded and st.button("🔍 Run Forensic Audit", type="primary"):
@@ -478,7 +469,6 @@ def dashboard_screen():
                         status.warning("  ⚠️ No items found.")
                         continue
 
-                    # Grouping
                     receipt_groups = {}
                     for item in items:
                         rid = item.get('rid', 0)
@@ -528,18 +518,23 @@ def dashboard_screen():
                 st.success("Audit Saved!")
                 time.sleep(1); st.rerun()
 
-    # 3. LEDGER
     with tab_ledger:
         if not df.empty:
-            col_f1, col_f2 = st.columns(2)
-            show_missing = col_f1.checkbox("⚠️ Show Missing Dates Only")
-            show_vices = col_f2.checkbox("😈 Show Vices Only")
+            st.info("💡 **Pro Tip:** Select rows to Bulk Edit. Use the Search box to Filter. **Ctrl+C / Ctrl+V** works in the table!")
             
+            # EXCEL-STYLE TOOLS
+            c_tools1, c_tools2 = st.columns([2, 1])
+            search_query = c_tools1.text_input("🔍 Search Ledger (Vendor, Item, Category)", placeholder="e.g. Tesco, Wine...")
+            
+            # Filter Logic
             df_view = df.copy()
-            df_view.insert(0, "Select", False)
+            if search_query:
+                # Case insensitive search across all string columns
+                mask = df_view.apply(lambda row: row.astype(str).str.contains(search_query, case=False).any(), axis=1)
+                df_view = df_view[mask]
             
-            if show_missing: df_view = df_view[df_view['Date'].isna()]
-            if show_vices: df_view = df_view[df_view['Is_Vice'] == True]
+            # Select Column
+            df_view.insert(0, "Select", False)
             
             edited_df = st.data_editor(
                 df_view, 
@@ -557,7 +552,7 @@ def dashboard_screen():
             # BULK ACTIONS
             selected_ids = edited_df[edited_df['Select'] == True]['id'].astype(str).tolist()
             if selected_ids:
-                st.info(f"⚡ {len(selected_ids)} items selected")
+                st.success(f"⚡ {len(selected_ids)} items selected")
                 col_b1, col_b2 = st.columns(2)
                 with col_b1:
                     new_bulk_date = st.date_input("Set Date for Selected:", value=None)
@@ -566,14 +561,35 @@ def dashboard_screen():
                         st.success("Updated!")
                         time.sleep(0.5); st.rerun()
                 with col_b2:
-                    if st.button("🗑️ Delete Selected"):
-                        conn = db._get_conn()
-                        ph = ','.join('?' * len(selected_ids))
-                        conn.execute(f"DELETE FROM transactions WHERE id IN ({ph})", selected_ids)
-                        conn.commit()
-                        conn.close()
-                        st.success("Deleted!")
+                    new_bulk_cat = st.selectbox("Set Category:", ["(No Change)", "Groceries", "Alcohol", "Dining", "Transport"])
+                    if new_bulk_cat != "(No Change)" and st.button("Apply Category"):
+                        db.bulk_update_ids(selected_ids, cat_val=new_bulk_cat)
+                        st.success("Updated!")
                         time.sleep(0.5); st.rerun()
+
+            # GLOBAL SAVE
+            if st.button("💾 Save All Manual Changes"):
+                # We need to map edits back to DB. For MVP with ID hidden, clearing/replacing subset is risky.
+                # Safer: Delete filtered subset from DB, then re-insert edited version.
+                # For now, simplest robust way: Delete ALL for user, Insert FULL TABLE (assuming user isn't paginated)
+                # But since we are filtering, we can't do full replace easily.
+                # BETTER MVP APPROACH: Only allow bulk actions for now, OR rely on st.data_editor's delta (complex).
+                # Fallback: Just re-save EVERYTHING shown? No, that deletes hidden rows.
+                # Solution: Loop through edited rows and update by ID.
+                conn = db._get_conn()
+                for i, row in edited_df.iterrows():
+                    # Update each row by ID
+                    # This is slow for 1000 rows but fine for MVP
+                    d_val = row['Date'].strftime('%Y-%m-%d') if pd.notnull(row['Date']) else None
+                    conn.execute("""
+                        UPDATE transactions 
+                        SET date=?, vendor=?, item=?, amount=?, category=?, sub_category=?, is_vice=?
+                        WHERE id=?
+                    """, (d_val, row['Vendor'], row['Item'], row['Amount'], row['Category'], row['Sub_Category'], int(row['Is_Vice']), row['id']))
+                conn.commit()
+                conn.close()
+                st.success("Changes Saved!")
+                time.sleep(0.5); st.rerun()
 
 if __name__ == "__main__":
     main()
