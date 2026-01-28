@@ -32,7 +32,7 @@ for d in DIRS.values(): d.mkdir(exist_ok=True)
 
 DB_PATH = DIRS["DB"] / "forensix.db"
 
-# --- DATABASE MANAGER (Robust) ---
+# --- DATABASE MANAGER ---
 class DatabaseManager:
     def __init__(self, db_path):
         self.db_path = str(db_path)
@@ -77,7 +77,6 @@ class DatabaseManager:
         try:
             conn.execute("SELECT income_freq FROM users LIMIT 1")
         except sqlite3.OperationalError:
-            # Silent migration for older DB versions
             cols = [
                 ("income_freq", "TEXT DEFAULT 'Yearly'"),
                 ("gross_income", "REAL DEFAULT 0"),
@@ -137,9 +136,9 @@ class DatabaseManager:
         if not df['Date'].empty:
              df['Date'] = pd.to_datetime(df['Date']).dt.strftime('%Y-%m-%d')
         
-        # Cleanup extra columns from UI
-        for c in ['selected', 'Select']:
-            if c in df.columns: df = df.drop(columns=[c])
+        cols_to_keep = ["Date", "Vendor", "Item", "Amount", "Currency", "IVA", "Category", "Sub_Category", "Is_Vice", "File"]
+        for c in df.columns:
+            if c not in cols_to_keep: df = df.drop(columns=[c])
 
         df_sql = df.rename(columns={
             "Date": "date", "Vendor": "vendor", "Item": "item", 
@@ -148,8 +147,6 @@ class DatabaseManager:
             "File": "file_name"
         })
         cols = ["username", "date", "vendor", "item", "amount", "currency", "iva", "category", "sub_category", "is_vice", "file_name"]
-        
-        # Ensure all columns exist
         for c in cols:
             if c not in df_sql.columns: df_sql[c] = None
             
@@ -188,7 +185,6 @@ class DatabaseManager:
     def clear_user_data(self, username):
         conn = self._get_conn()
         conn.execute("DELETE FROM transactions WHERE username = ?", (username,))
-        # Reset profile too as requested
         conn.execute("UPDATE users SET gross_income = 0 WHERE username = ?", (username,))
         conn.commit()
         conn.close()
@@ -220,8 +216,7 @@ def calculate_net_monthly(gross, freq, residency):
         bands = [(12450, 0.19), (20200, 0.24), (35200, 0.30), (60000, 0.37), (300000, 0.45)]
         for lim, rate in bands:
             if base > prev: 
-                irpf += (min(base, lim) - prev) * rate
-                prev = lim
+                irpf += (min(base, lim) - prev) * rate; prev = lim
             else: break
         net_annual = annual_gross - ss - irpf
     else:
@@ -278,22 +273,21 @@ class AIEngine:
     def analyze_image_bytes(self, image_bytes, mime_type, user_vices, currency):
         if not self.client: raise ValueError("No API Key")
         
-        # PROMPT REFINED FOR ACCURACY
+        # PROMPT RE-WIRED TO USE 'USER_VICES'
         prompt = f"""
         Role: Forensic Receipt Scanner.
-        Task: OCR every single transaction line.
+        Task: OCR every transaction line.
         JSON Format: [{{ "rid": 1, "d": "DD/MM/YYYY", "v": "Vendor", "n": "Item Name", "p": 1.00, "c": "£", "mc": "Category", "sc": "SubCategory", "vice": false }}]
         
-        CRITICAL RULES:
-        1. **VENDOR:** If header says 'CONTINUED' or 'CONT', ignore it. Look for the real shop name. If unsure, use 'Unknown'.
-        2. **SUB-CATEGORY:** Do not leave blank. Guess based on item name (e.g., 'Milk' -> 'Dairy', 'Fuel' -> 'Petrol').
-        3. **VICES:** Check for words like: {user_vices}.
-        4. **GROUPING:** Assign 'rid' to keep items from the same receipt together.
-        5. **CURRENCY:** Default {currency}.
+        RULES:
+        1. **VICES:** Check items for these keywords: "{user_vices}". If found, set "vice": true.
+        2. **SUB-CATEGORY:** Use specific words (e.g. 'Vodka' -> 'Spirits', 'Diesel' -> 'Fuel').
+        3. **VENDOR:** Ignore 'CONT', 'VISA'. Use real shop name.
+        4. **CURRENCY:** Default {currency}.
         """
         
-        # CASCADE MODEL SELECTOR (Reliability First)
-        models_to_try = ["gemini-1.5-pro", "gemini-1.5-flash", "gemini-1.0-pro"]
+        # USE GENERIC 'gemini-pro' (The Universal Model)
+        models_to_try = ["gemini-1.5-flash", "gemini-pro", "gemini-1.5-pro"]
         for model in models_to_try:
             try:
                 res = self.client.models.generate_content(
@@ -303,32 +297,29 @@ class AIEngine:
                 )
                 return clean_json_response(res.text)
             except Exception as e:
-                # print(f"Model {model} failed: {e}") # Silent failover
-                time.sleep(1)
+                # print(f"Model {model} failed: {e}") 
                 continue 
-        raise Exception("All AI models failed connectivity.")
+        raise Exception("All AI models failed.")
 
     def generate_financial_advice(self, summary_text):
         prompt = f"""
-        Act as a no-nonsense financial advisor.
+        Act as a financial coach. 
         Analyze this spending data.
-        Provide 3 sharp, specific observations.
-        - Highlight specific 'Vice' spending if high.
-        - Point out the most expensive Sub-Category.
-        - Be professional but engaging.
+        Give 3 short, punchy observations about habits.
         DATA: {summary_text}
         """
-        # CASCADE FOR TEXT GENERATION (Fixes 404s)
-        models_to_try = ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-1.0-pro", "gemini-pro"]
+        # USE STABLE MODEL 'gemini-pro'
+        models_to_try = ["gemini-pro", "gemini-1.5-flash"]
         
         for model in models_to_try:
             try:
                 res = self.client.models.generate_content(model=model, contents=prompt)
                 return res.text
             except Exception as e:
+                # print(f"Advice Error {model}: {e}")
                 continue
         
-        return "⚠️ AI Service Busy. **Analysis:** Review your Top 3 Categories manually. Ensure no duplicate receipts."
+        return "⚠️ AI Advice Unavailable. (API connectivity issue)"
 
 # --- APP LOGIC ---
 db = DatabaseManager(DB_PATH)
@@ -409,17 +400,17 @@ def dashboard_screen():
 
     st.title("📊 Forensic Dashboard")
     
-    # 1. LOAD FULL DATA
+    # 1. LOAD DATA
     df_full = db.get_user_data(st.session_state.user)
     
-    # 2. GLOBAL FILTER & TIMELINE
+    # 2. PERIOD CONTROLS
     today = datetime.now()
     start_date = df_full['Date'].min() if not df_full.empty and df_full['Date'].notna().any() else today
     end_date = df_full['Date'].max() if not df_full.empty and df_full['Date'].notna().any() else today
     
     if not df_full.empty:
-        with st.expander("📅 Global Timeframe & Controls", expanded=True):
-            # Buttons
+        with st.expander("📅 Period Controls", expanded=True):
+            # BUTTONS RESTORED
             c_btn1, c_btn2, c_btn3, c_btn4 = st.columns(4)
             if c_btn1.button("This Month", use_container_width=True):
                 start_date = today.replace(day=1); end_date = today
@@ -430,7 +421,7 @@ def dashboard_screen():
             if c_btn4.button("All Time", use_container_width=True):
                 start_date = df_full['Date'].min(); end_date = df_full['Date'].max()
             
-            # Slider
+            # SLIDER RESTORED
             date_range = st.slider("", 
                 min_value=df_full['Date'].min().date() if df_full['Date'].notna().any() else today.date(), 
                 max_value=df_full['Date'].max().date() if df_full['Date'].notna().any() else today.date(),
@@ -438,7 +429,7 @@ def dashboard_screen():
                 label_visibility="collapsed"
             )
         
-        # FILTER DATA
+        # APPLY FILTER TO *EVERYTHING*
         mask = (df_full['Date'].dt.date >= date_range[0]) & (df_full['Date'].dt.date <= date_range[1])
         df_filtered = df_full.loc[mask].copy()
     else:
@@ -461,7 +452,6 @@ def dashboard_screen():
     # --- ANALYTICS ---
     with tab_dash:
         if not df_filtered.empty:
-            # AI BUTTON
             col_advice, col_btn = st.columns([4, 1])
             with col_btn:
                 if st.button("💡 Get AI Insight"):
@@ -477,26 +467,23 @@ def dashboard_screen():
                 if 'ai_advice' in st.session_state: st.info(st.session_state.ai_advice)
 
             st.divider()
-            
             domain = ["Groceries", "Alcohol", "Dining", "Transport", "Shopping", "Utilities", "Services", "Unknown"]
             range_ = ["#2ecc71", "#9b59b6", "#e67e22", "#3498db", "#f1c40f", "#95a5a6", "#34495e", "#bdc3c7"]
             
             c1, c2 = st.columns(2)
             with c1:
                 st.subheader("Category Breakdown")
-                # Filter Null Categories
-                chart_df = df_filtered[df_filtered['Category'].notna()]
-                chart = alt.Chart(chart_df).mark_bar().encode(
+                clean_df = df_filtered[df_filtered['Category'].notna()]
+                chart = alt.Chart(clean_df).mark_bar().encode(
                     x=alt.X('Category', sort='-y'), y='Amount', color=alt.Color('Category', scale=alt.Scale(domain=domain, range=range_))
                 ).interactive()
                 st.altair_chart(chart, use_container_width=True)
             with c2:
                 st.subheader("Top Sub-Categories")
-                # Filter Null SubCats
-                deep_df = df_filtered[df_filtered['Sub_Category'].notna() & (df_filtered['Sub_Category'] != 'None') & (df_filtered['Sub_Category'] != 'null')]
-                deep_agg = deep_df.groupby('Sub_Category')['Amount'].sum().reset_index().sort_values('Amount', ascending=False).head(10)
+                # Removed 'None' filter to show everything
+                deep_agg = df_filtered.groupby('Sub_Category')['Amount'].sum().reset_index().sort_values('Amount', ascending=False).head(10)
                 deep_chart = alt.Chart(deep_agg).mark_bar().encode(
-                    y=alt.Y('Sub_Category', sort='-x'), x='Amount', color=alt.value('#3498db')
+                    y=alt.Y('Sub_Category', sort='-x'), x='Amount', color=alt.value('#3498db'), tooltip=['Sub_Category', 'Amount']
                 ).interactive()
                 st.altair_chart(deep_chart, use_container_width=True)
 
@@ -504,13 +491,9 @@ def dashboard_screen():
             with r2c1:
                 st.subheader("Vice Hunter")
                 vice_df = df_filtered[df_filtered['Is_Vice'] == True]
-                vice_df = vice_df[vice_df['Sub_Category'].notna()]
                 if not vice_df.empty:
                     base = alt.Chart(vice_df).encode(theta=alt.Theta("Amount", stack=True))
-                    pie = base.mark_arc(outerRadius=100).encode(
-                        color=alt.Color("Sub_Category"), 
-                        tooltip=["Sub_Category", "Amount"]
-                    )
+                    pie = base.mark_arc(outerRadius=100).encode(color=alt.Color("Sub_Category"), tooltip=["Sub_Category", "Amount"])
                     st.altair_chart(pie, use_container_width=True)
                 else: st.success("No Vices Detected.")
             
@@ -540,7 +523,6 @@ def dashboard_screen():
                     with open(tpath, "wb") as file: file.write(f.getbuffer())
                     
                     items = []
-                    # Logic for Scan
                     if f.type != "application/pdf":
                         slices = smart_slice_image(tpath)
                         for s in slices:
@@ -553,7 +535,6 @@ def dashboard_screen():
                     
                     if not items: continue
 
-                    # Sanitize & Save
                     receipt_groups = {}
                     for item in items:
                         rid = item.get('rid', 0)
@@ -569,10 +550,7 @@ def dashboard_screen():
                         for item in group_items:
                             name = str(item.get("n", "Item"))
                             vendor = str(item.get("v", "Unknown")).upper()
-                            
-                            # SANITIZER: Ban bad vendors
-                            if vendor in ["CONT", "CONTINUED", "VISA", "MASTERCARD", "TOTAL", "CHANGE"]:
-                                vendor = "Unknown"
+                            if vendor in ["CONT", "CONTINUED", "VISA", "MASTERCARD", "TOTAL"]: vendor = "Unknown"
                             
                             if any(x in name.lower() for x in ["total", "subtotal", "balance"]): continue
                             
@@ -602,7 +580,7 @@ def dashboard_screen():
     with tab_ledger:
         if not df_full.empty:
             
-            # ADVANCED QUERY TOOL (Restored)
+            # ADVANCED QUERY TOOL
             with st.expander("🛠️ Advanced Query Tool", expanded=False):
                 cf1, cf2, cf3, cf4 = st.columns(4)
                 f_vend = cf1.multiselect("Vendor", options=df_full['Vendor'].unique())
@@ -621,6 +599,7 @@ def dashboard_screen():
             
             df_view.insert(0, "Select", False)
             
+            # SORTABLE GRID (Click Headers)
             edited_df = st.data_editor(
                 df_view, 
                 num_rows="dynamic", 
@@ -657,7 +636,7 @@ def dashboard_screen():
                         conn.commit(); conn.close()
                         st.rerun()
 
-            if st.button("💾 Save Grid Changes"):
+            if st.button("💾 Save All Grid Edits"):
                 conn = db._get_conn()
                 for i, row in edited_df.iterrows():
                     d_val = row['Date'].strftime('%Y-%m-%d') if pd.notnull(row['Date']) else None
@@ -672,4 +651,5 @@ def dashboard_screen():
 
 if __name__ == "__main__":
     main()
+
     
