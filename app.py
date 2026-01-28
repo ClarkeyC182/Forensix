@@ -16,7 +16,13 @@ from datetime import datetime, timedelta
 from PIL import Image
 
 # --- CONFIGURATION ---
-st.set_page_config(page_title="Forensix Pro", page_icon="🕵️‍♂️", layout="wide")
+st.set_page_config(
+    page_title="Forensix Pro",
+    page_icon="🕵️‍♂️",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
 BASE_DIR = Path(__file__).parent.absolute()
 DIRS = {
     "TEMP": BASE_DIR / "temp_uploads",
@@ -71,9 +77,12 @@ class DatabaseManager:
         try:
             c.execute("SELECT gross_income FROM users LIMIT 1")
         except sqlite3.OperationalError:
-            c.execute("ALTER TABLE users ADD COLUMN gross_income REAL DEFAULT 0")
-            c.execute("ALTER TABLE users ADD COLUMN tax_residency TEXT DEFAULT 'UK'")
-            c.execute("ALTER TABLE users ADD COLUMN currency TEXT DEFAULT '£'")
+            try: c.execute("ALTER TABLE users ADD COLUMN gross_income REAL DEFAULT 0")
+            except: pass
+            try: c.execute("ALTER TABLE users ADD COLUMN tax_residency TEXT DEFAULT 'UK'")
+            except: pass
+            try: c.execute("ALTER TABLE users ADD COLUMN currency TEXT DEFAULT '£'")
+            except: pass
             conn.commit()
         finally:
             conn.close()
@@ -124,7 +133,9 @@ class DatabaseManager:
         if not df['Date'].empty:
              df['Date'] = pd.to_datetime(df['Date']).dt.strftime('%Y-%m-%d')
         
-        if 'selected' in df.columns: df = df.drop(columns=['selected'])
+        cols_to_drop = ['selected', 'Select']
+        for c in cols_to_drop:
+            if c in df.columns: df = df.drop(columns=[c])
 
         df_sql = df.rename(columns={
             "Date": "date", "Vendor": "vendor", "Item": "item", 
@@ -133,6 +144,11 @@ class DatabaseManager:
             "File": "file_name"
         })
         cols = ["username", "date", "vendor", "item", "amount", "currency", "iva", "category", "sub_category", "is_vice", "file_name"]
+        
+        # Ensure columns exist in DF
+        for c in cols:
+            if c not in df_sql.columns: df_sql[c] = None
+            
         df_sql[cols].to_sql("transactions", conn, if_exists="append", index=False)
         conn.close()
 
@@ -190,10 +206,14 @@ def calculate_net_monthly(gross, residency):
         irpf, prev = 0.0, 0
         bands = [(12450, 0.19), (20200, 0.24), (35200, 0.30), (60000, 0.37), (300000, 0.45)]
         for lim, rate in bands:
-            if base > prev: irpf += (min(base, lim) - prev) * rate; prev = lim
+            if base > prev: 
+                irpf += (min(base, lim) - prev) * rate
+                prev = lim
             else: break
         net = gross - ss - irpf
-    else: net = gross * 0.75
+    else:
+        # Global Estimator (approx 30% tax flat for MVP)
+        net = gross * 0.70
     return net / 12
 
 # --- UTILS ---
@@ -282,14 +302,14 @@ class AIEngine:
         Focus on 'Discretionary' (Vices) and Sub-Category trends.
         DATA: {summary_text}
         """
-        # DAISY CHAIN FOR ADVICE
+        # UNSTOPPABLE DAISY CHAIN
         models_to_try = ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-1.0-pro"]
         for model in models_to_try:
             try:
                 res = self.client.models.generate_content(model=model, contents=prompt)
                 return res.text
             except: continue
-        return "⚠️ AI Advice Unavailable (All models busy/errored)"
+        return "⚠️ AI Advice Unavailable (API Error)"
 
 # --- APP LOGIC ---
 db = DatabaseManager(DB_PATH)
@@ -324,12 +344,15 @@ def login_screen():
                     else: st.error("Taken")
 
 def dashboard_screen():
-    # RELOAD PROFILE ON EVERY RENDER
+    df = db.get_user_data(st.session_state.user)
     profile = db.get_user_profile(st.session_state.user)
+    
+    # Defaults
     home_curr = profile.get('currency', '£')
     user_residency = profile.get('tax_residency', 'UK')
     user_gross = profile.get('gross_income', 0.0)
     
+    # --- SIDEBAR ---
     with st.sidebar:
         st.write(f"👤 **{st.session_state.user}**")
         if st.button("Log Out"):
@@ -338,15 +361,28 @@ def dashboard_screen():
         
         st.divider()
         st.subheader("💰 Financial Profile")
-        with st.form("profile_form"):
-            new_residency = st.selectbox("Residency", ["UK (GBP)", "Spain (EUR)", "Other (USD)"], 
-                                         index=0 if "UK" in user_residency else 1 if "Spain" in user_residency else 2)
+        
+        # FIXED FORM - NO ENTER KEY OVERLAP
+        with st.form("profile_form", clear_on_submit=False):
+            res_options = ["UK (GBP)", "Spain (EUR)", "USA (USD)", "Australia (AUD)", "Canada (CAD)", "Japan (JPY)", "Europe (EUR)"]
+            
+            # Smart default index
+            def_idx = 0
+            for i, r in enumerate(res_options):
+                if user_residency in r: def_idx = i; break
+            
+            new_residency = st.selectbox("Residency", res_options, index=def_idx)
             new_gross = st.number_input("Annual Gross Income", value=float(user_gross), step=1000.0)
-            if st.form_submit_button("Update Profile"):
-                curr = "£" if "UK" in new_residency else "€" if "Spain" in new_residency else "$"
-                db.update_user_profile(st.session_state.user, new_gross, new_residency, curr)
-                st.success("Updated!")
-                time.sleep(0.5); st.rerun() # FORCE RERUN TO UPDATE METRICS
+            
+            if st.form_submit_button("💾 Save Profile"):
+                # Extract currency code from brackets e.g. "UK (GBP)" -> "£"
+                curr_map = {"GBP": "£", "EUR": "€", "USD": "$", "AUD": "A$", "CAD": "C$", "JPY": "¥"}
+                curr_code = new_residency.split("(")[1].replace(")", "")
+                symbol = curr_map.get(curr_code, curr_code)
+                
+                db.update_user_profile(st.session_state.user, new_gross, new_residency, symbol)
+                st.success("Profile Updated!")
+                time.sleep(0.5); st.rerun()
         
         st.divider()
         vices = st.text_area("Vices", "alcohol, candy, betting")
@@ -356,49 +392,53 @@ def dashboard_screen():
 
     st.title("📊 Forensic Dashboard")
     
-    # RELOAD DATA
-    df = db.get_user_data(st.session_state.user)
-    
+    # METRICS
     net_monthly = calculate_net_monthly(user_gross, user_residency)
     total_spend = df['Amount'].sum() if not df.empty else 0.0
     vice_spend = df[df['Is_Vice']]['Amount'].sum() if not df.empty else 0.0
     remaining = net_monthly - total_spend
     
-    # METRICS
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Net Monthly", f"{home_curr}{net_monthly:,.2f}")
     c2.metric("Total Spend", f"{home_curr}{total_spend:,.2f}")
     c3.metric("Remaining", f"{home_curr}{remaining:,.2f}", delta="Surplus" if remaining > 0 else "Deficit")
     c4.metric("Vice Leakage", f"{home_curr}{vice_spend:,.2f}", delta="Waste", delta_color="inverse")
     
+    # DATA PROCESSING FOR CHARTS
     if not df.empty:
         today = datetime.now()
         start_date = df['Date'].min() if df['Date'].notna().any() else today
         end_date = df['Date'].max() if df['Date'].notna().any() else today
         
-        # BASIC SLIDER
-        cf1, cf2, cf3 = st.columns([2, 1, 1])
-        with cf1:
-            date_range = st.slider("", 
-                min_value=df['Date'].min().date() if df['Date'].notna().any() else today.date(), 
-                max_value=df['Date'].max().date() if df['Date'].notna().any() else today.date(),
-                value=(start_date.date(), end_date.date()),
-                label_visibility="collapsed"
-            )
+        # FILTER BAR
+        with st.expander("🔎 Filter & Timeline Control", expanded=True):
+            cf1, cf2 = st.columns([3, 1])
+            with cf1:
+                date_range = st.slider("Time Range", 
+                    min_value=df['Date'].min().date() if df['Date'].notna().any() else today.date(), 
+                    max_value=df['Date'].max().date() if df['Date'].notna().any() else today.date(),
+                    value=(start_date.date(), end_date.date())
+                )
+            with cf2:
+                st.write("") # Spacer
+                if st.button("Reset to All Time", use_container_width=True):
+                    date_range = (df['Date'].min().date(), df['Date'].max().date())
         
         mask = (df['Date'].dt.date >= date_range[0]) & (df['Date'].dt.date <= date_range[1])
         df_chart = df.loc[mask].copy()
     else:
         df_chart = pd.DataFrame()
 
+    # TABS
     tab_dash, tab_upload, tab_ledger = st.tabs(["📈 Analytics", "📤 Upload", "📝 Ledger"])
     
     with tab_dash:
         if not df_chart.empty:
+            # AI ADVISOR
             col_advice, col_btn = st.columns([4, 1])
             with col_btn:
-                if st.button("💡 Generate AI Insight"):
-                    with st.spinner("Thinking..."):
+                if st.button("💡 Get AI Insight"):
+                    with st.spinner("Analyzing..."):
                         summary = df_chart.groupby('Category')['Amount'].sum().to_string()
                         sub_summary = df_chart.groupby('Sub_Category')['Amount'].sum().sort_values(ascending=False).head(5).to_string()
                         vice_sum = df_chart[df_chart['Is_Vice']]['Amount'].sum()
@@ -464,10 +504,6 @@ def dashboard_screen():
                         with open(tpath, "rb") as pdf_file:
                             items.extend(ai.analyze_image_bytes(pdf_file.read(), "application/pdf", vices, home_curr))
                     
-                    if not items:
-                        status.warning("  ⚠️ No items found.")
-                        continue
-
                     receipt_groups = {}
                     for item in items:
                         rid = item.get('rid', 0)
@@ -519,19 +555,17 @@ def dashboard_screen():
 
     with tab_ledger:
         if not df.empty:
-            # --- TRUE EXCEL FILTERS ---
-            with st.expander("🔎 Filter Ledger"):
+            # --- ADVANCED FILTERING ---
+            with st.expander("🛠️ Ledger Tools (Filter & Sort)", expanded=False):
                 col_f1, col_f2, col_f3 = st.columns(3)
                 
-                # Filter by Category
+                # Dynamic Filters
                 all_cats = ["All"] + list(df['Category'].unique())
-                sel_cat = col_f1.multiselect("Category", all_cats, default=[])
+                sel_cat = col_f1.multiselect("Filter Category", all_cats, default=[])
                 
-                # Filter by Vendor
                 all_vendors = ["All"] + list(df['Vendor'].unique())
-                sel_vend = col_f2.multiselect("Vendor", all_vendors, default=[])
+                sel_vend = col_f2.multiselect("Filter Vendor", all_vendors, default=[])
                 
-                # Filter by Missing
                 show_missing = col_f3.checkbox("Show Missing Dates Only")
                 
             # APPLY FILTERS
@@ -545,8 +579,6 @@ def dashboard_screen():
             
             # Select Column
             df_view.insert(0, "Select", False)
-            
-            st.info("💡 **Pro Tip:** Click a cell, then `Ctrl+C` to copy. Select range and `Ctrl+V` to paste.")
             
             edited_df = st.data_editor(
                 df_view, 
@@ -564,16 +596,16 @@ def dashboard_screen():
             # BULK ACTIONS
             selected_ids = edited_df[edited_df['Select'] == True]['id'].astype(str).tolist()
             if selected_ids:
-                st.success(f"⚡ {len(selected_ids)} items selected")
+                st.info(f"⚡ {len(selected_ids)} items selected")
                 col_b1, col_b2 = st.columns(2)
                 with col_b1:
-                    new_bulk_date = st.date_input("Set Date for Selected:", value=None)
+                    new_bulk_date = st.date_input("Set Date:", value=None)
                     if st.button("Apply Date"):
                         db.bulk_update_ids(selected_ids, date_val=new_bulk_date)
                         st.success("Updated!")
                         time.sleep(0.5); st.rerun()
                 with col_b2:
-                    if st.button("🗑️ Delete Selected"):
+                    if st.button("🗑️ Delete"):
                         conn = db._get_conn()
                         ph = ','.join('?' * len(selected_ids))
                         conn.execute(f"DELETE FROM transactions WHERE id IN ({ph})", selected_ids)
@@ -582,7 +614,7 @@ def dashboard_screen():
                         st.success("Deleted!")
                         time.sleep(0.5); st.rerun()
 
-            if st.button("💾 Save All Manual Changes"):
+            if st.button("💾 Save All Changes"):
                 conn = db._get_conn()
                 for i, row in edited_df.iterrows():
                     d_val = row['Date'].strftime('%Y-%m-%d') if pd.notnull(row['Date']) else None
@@ -593,9 +625,9 @@ def dashboard_screen():
                     """, (d_val, row['Vendor'], row['Item'], row['Amount'], row['Category'], row['Sub_Category'], int(row['Is_Vice']), row['id']))
                 conn.commit()
                 conn.close()
-                st.success("Changes Saved!")
+                st.success("Saved!")
                 time.sleep(0.5); st.rerun()
 
 if __name__ == "__main__":
     main()
-    
+
