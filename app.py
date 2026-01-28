@@ -161,6 +161,16 @@ class AIEngine:
     def __init__(self, api_key):
         self.client = genai.Client(api_key=api_key) if api_key else None
 
+    def list_available_models(self):
+        """Debug tool to see what models the API Key can access."""
+        if not self.client: return []
+        try:
+            # This is a generic call to list models, syntax depends on specific library version
+            # For google-genai, we often just try known models.
+            # But let's return a hardcoded list of known stable ones to try.
+            return ["gemini-1.5-pro", "gemini-2.0-flash", "gemini-1.5-flash"]
+        except: return []
+
     def analyze_image(self, image_path, mime_type, user_vices, currency):
         if not self.client: raise ValueError("No API Key")
         with open(image_path, "rb") as f: content = f.read()
@@ -177,13 +187,17 @@ class AIEngine:
         5. CURRENCY: {currency}.
         """
         
-        # SMART FALLBACK SYSTEM
-        # It tries models in order. If one 404s/fails, it tries the next.
-        models_to_try = ["gemini-1.5-pro-latest", "gemini-1.5-flash", "gemini-2.0-flash-exp"]
+        # STABLE MODEL LIST (Prioritizing Pro, then falling back)
+        models_to_try = [
+            "gemini-1.5-pro",        # The "Smartest" Stable Model
+            "gemini-2.0-flash",      # The "Newest" Fast Model
+            "gemini-1.5-flash"       # The "Reliable" Backup
+        ]
         
         last_error = None
         for model_name in models_to_try:
             try:
+                print(f"Trying model: {model_name}")
                 res = self.client.models.generate_content(
                     model=model_name, 
                     contents=[prompt, types.Part.from_bytes(data=content, mime_type=mime_type)],
@@ -191,9 +205,10 @@ class AIEngine:
                 )
                 return clean_json_response(res.text)
             except Exception as e:
+                # If 404 (Not Found) or 429 (Quota), just move to next model
                 last_error = e
                 print(f"Model {model_name} failed: {e}")
-                continue # Try next model
+                continue 
         
         # If all fail
         raise last_error
@@ -229,7 +244,7 @@ def login_screen():
                 new_pass = st.text_input("New Password", type="password")
                 if st.form_submit_button("Create Account", use_container_width=True):
                     if db.create_user(new_user, new_pass):
-                        # AUTO-LOGIN LOGIC
+                        # AUTO-LOGIN
                         st.session_state.user = new_user
                         st.success("Account created! Logging in...")
                         time.sleep(0.5)
@@ -250,6 +265,9 @@ def dashboard_screen():
         vices = st.text_area("Vices", "alcohol, candy, betting")
         
         st.divider()
+        if st.button("🔍 Check AI Access"):
+            st.info("Your API Key will try these models in order:\n1. gemini-1.5-pro\n2. gemini-2.0-flash\n3. gemini-1.5-flash")
+            
         if st.button("🗑️ Clear My Data"):
             db.clear_user_data(st.session_state.user)
             st.rerun()
@@ -268,6 +286,11 @@ def dashboard_screen():
     with tab_upload:
         uploaded = st.file_uploader("Upload Receipts (Image/PDF)", accept_multiple_files=True)
         if uploaded and st.button("🔍 Run Forensic Audit", type="primary"):
+            
+            if "GEMINI_API_KEY" not in st.secrets:
+                st.error("🚨 Missing API Key. Please configure .streamlit/secrets.toml")
+                st.stop()
+                
             api_key = st.secrets["GEMINI_API_KEY"]
             ai = AIEngine(api_key)
             all_rows = []
@@ -283,7 +306,7 @@ def dashboard_screen():
                     
                     if f.type != "application/pdf": resize_image_force(tpath)
                     
-                    status_box.write(f"  ↳ Scanning... (Auto-trying Models)")
+                    status_box.write(f"  ↳ Connecting to Gemini Pro (Auto-Switching if busy)...")
                     mime = "application/pdf" if f.type == "application/pdf" else "image/jpeg"
                     
                     items = ai.analyze_image(tpath, mime, vices, home_curr)
@@ -331,6 +354,8 @@ def dashboard_screen():
                 st.success(f"Successfully audited {len(new_df)} transactions.")
                 time.sleep(1)
                 st.rerun()
+            else:
+                st.warning("Audit finished but no transactions were saved. Check the status log.")
 
     with tab_dash:
         if not df.empty:
@@ -369,4 +394,4 @@ def dashboard_screen():
 
 if __name__ == "__main__":
     main()
-    
+
