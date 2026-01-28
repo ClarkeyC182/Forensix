@@ -273,21 +273,21 @@ class AIEngine:
     def analyze_image_bytes(self, image_bytes, mime_type, user_vices, currency):
         if not self.client: raise ValueError("No API Key")
         
-        # PROMPT RE-WIRED TO USE 'USER_VICES'
+        # PROMPT ENFORCING VICES
         prompt = f"""
         Role: Forensic Receipt Scanner.
         Task: OCR every transaction line.
         JSON Format: [{{ "rid": 1, "d": "DD/MM/YYYY", "v": "Vendor", "n": "Item Name", "p": 1.00, "c": "£", "mc": "Category", "sc": "SubCategory", "vice": false }}]
         
         RULES:
-        1. **VICES:** Check items for these keywords: "{user_vices}". If found, set "vice": true.
+        1. **VICES:** Check items for keywords: "{user_vices}". If found, set "vice": true.
         2. **SUB-CATEGORY:** Use specific words (e.g. 'Vodka' -> 'Spirits', 'Diesel' -> 'Fuel').
         3. **VENDOR:** Ignore 'CONT', 'VISA'. Use real shop name.
         4. **CURRENCY:** Default {currency}.
         """
         
-        # USE GENERIC 'gemini-pro' (The Universal Model)
-        models_to_try = ["gemini-1.5-flash", "gemini-pro", "gemini-1.5-pro"]
+        # CASCADE: Try Flash 1.5 -> Pro 1.5 -> Pro 1.0
+        models_to_try = ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-1.0-pro"]
         for model in models_to_try:
             try:
                 res = self.client.models.generate_content(
@@ -297,7 +297,7 @@ class AIEngine:
                 )
                 return clean_json_response(res.text)
             except Exception as e:
-                # print(f"Model {model} failed: {e}") 
+                time.sleep(1)
                 continue 
         raise Exception("All AI models failed.")
 
@@ -308,18 +308,17 @@ class AIEngine:
         Give 3 short, punchy observations about habits.
         DATA: {summary_text}
         """
-        # USE STABLE MODEL 'gemini-pro'
-        models_to_try = ["gemini-pro", "gemini-1.5-flash"]
+        # CASCADE FOR ADVICE
+        models_to_try = ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-1.0-pro"]
         
         for model in models_to_try:
             try:
                 res = self.client.models.generate_content(model=model, contents=prompt)
                 return res.text
             except Exception as e:
-                # print(f"Advice Error {model}: {e}")
                 continue
         
-        return "⚠️ AI Advice Unavailable. (API connectivity issue)"
+        return "⚠️ AI Advice Unavailable (Network Error)"
 
 # --- APP LOGIC ---
 db = DatabaseManager(DB_PATH)
@@ -400,16 +399,16 @@ def dashboard_screen():
 
     st.title("📊 Forensic Dashboard")
     
-    # 1. LOAD DATA
+    # 1. LOAD FULL DATA
     df_full = db.get_user_data(st.session_state.user)
     
-    # 2. PERIOD CONTROLS
+    # 2. TIMELINE CONTROLS
     today = datetime.now()
     start_date = df_full['Date'].min() if not df_full.empty and df_full['Date'].notna().any() else today
     end_date = df_full['Date'].max() if not df_full.empty and df_full['Date'].notna().any() else today
     
     if not df_full.empty:
-        with st.expander("📅 Period Controls", expanded=True):
+        with st.expander("📅 Timeline Controls", expanded=True):
             # BUTTONS RESTORED
             c_btn1, c_btn2, c_btn3, c_btn4 = st.columns(4)
             if c_btn1.button("This Month", use_container_width=True):
@@ -480,7 +479,6 @@ def dashboard_screen():
                 st.altair_chart(chart, use_container_width=True)
             with c2:
                 st.subheader("Top Sub-Categories")
-                # Removed 'None' filter to show everything
                 deep_agg = df_filtered.groupby('Sub_Category')['Amount'].sum().reset_index().sort_values('Amount', ascending=False).head(10)
                 deep_chart = alt.Chart(deep_agg).mark_bar().encode(
                     y=alt.Y('Sub_Category', sort='-x'), x='Amount', color=alt.value('#3498db'), tooltip=['Sub_Category', 'Amount']
@@ -525,7 +523,7 @@ def dashboard_screen():
                     items = []
                     if f.type != "application/pdf":
                         slices = smart_slice_image(tpath)
-                        for s in slices:
+                        for idx, s in enumerate(slices):
                             _, buf = cv2.imencode(".jpg", s)
                             try: items.extend(ai.analyze_image_bytes(buf.tobytes(), "image/jpeg", vices_input, home_curr))
                             except: continue
@@ -550,6 +548,7 @@ def dashboard_screen():
                         for item in group_items:
                             name = str(item.get("n", "Item"))
                             vendor = str(item.get("v", "Unknown")).upper()
+                            # SANITIZER: Ban bad vendors
                             if vendor in ["CONT", "CONTINUED", "VISA", "MASTERCARD", "TOTAL"]: vendor = "Unknown"
                             
                             if any(x in name.lower() for x in ["total", "subtotal", "balance"]): continue
@@ -580,8 +579,8 @@ def dashboard_screen():
     with tab_ledger:
         if not df_full.empty:
             
-            # ADVANCED QUERY TOOL
-            with st.expander("🛠️ Advanced Query Tool", expanded=False):
+            # DATA SLICER
+            with st.expander("🛠️ Data Slicer (Filters)", expanded=False):
                 cf1, cf2, cf3, cf4 = st.columns(4)
                 f_vend = cf1.multiselect("Vendor", options=df_full['Vendor'].unique())
                 f_cat = cf2.multiselect("Category", options=df_full['Category'].unique())
@@ -590,8 +589,7 @@ def dashboard_screen():
                 show_missing = st.checkbox("⚠️ Show Missing Dates Only")
             
             # APPLY FILTERS
-            df_view = df_filtered.copy() # Start with time-filtered set
-            
+            df_view = df_filtered.copy()
             if f_vend: df_view = df_view[df_view['Vendor'].isin(f_vend)]
             if f_cat: df_view = df_view[df_view['Category'].isin(f_cat)]
             df_view = df_view[(df_view['Amount'] >= f_min) & (df_view['Amount'] <= f_max)]
@@ -599,7 +597,6 @@ def dashboard_screen():
             
             df_view.insert(0, "Select", False)
             
-            # SORTABLE GRID (Click Headers)
             edited_df = st.data_editor(
                 df_view, 
                 num_rows="dynamic", 
@@ -651,5 +648,4 @@ def dashboard_screen():
 
 if __name__ == "__main__":
     main()
-
     
