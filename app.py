@@ -90,10 +90,9 @@ class DatabaseManager:
         df['username'] = username
         df['is_vice'] = df['Is_Vice'].astype(int) 
         
-        # STRICT DATE SAVING: Convert to string YYYY-MM-DD to allow SQLite storage
-        # This prevents the "Object" error later
-        if not df['Date'].empty:
-             df['Date'] = pd.to_datetime(df['Date']).dt.strftime('%Y-%m-%d')
+        # Save dates as string YYYY-MM-DD or NULL
+        # This preserves "None" so we know it's missing
+        df['Date'] = df['Date'].apply(lambda x: x.strftime('%Y-%m-%d') if pd.notnull(x) else None)
 
         df_sql = df.rename(columns={
             "Date": "date", "Vendor": "vendor", "Item": "item", 
@@ -121,12 +120,8 @@ class DatabaseManager:
         
         df['Is_Vice'] = df['Is_Vice'].astype(bool)
         
-        # CRITICAL FIX: Safe Date Loading
-        # 'coerce' turns garbage dates into NaT (Not a Time) instead of Crashing
+        # Load dates, keep NaT for missing ones so we can flag them
         df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
-        # Fill any failures with Today to keep the app running
-        df['Date'] = df['Date'].fillna(pd.Timestamp.now())
-        
         return df
 
     def clear_user_data(self, username):
@@ -143,25 +138,23 @@ def safe_float(val):
     except: return 0.0
 
 def safe_date(val):
+    """
+    Returns a Timestamp if valid, or None (NaT) if invalid/missing.
+    No more guessing 'Today'.
+    """
     try:
         s = str(val).strip().lower()
-        if s in ['none', 'null', 'nan', '', 'yyyy-mm-dd', 'unknown']: return pd.Timestamp.now()
+        if s in ['none', 'null', 'nan', '', 'yyyy-mm-dd', 'unknown']: return None
+        
         dt = pd.to_datetime(val, errors='coerce', dayfirst=True)
-        if pd.isna(dt): return pd.Timestamp.now()
+        if pd.isna(dt): return None
         
         now = pd.Timestamp.now()
-        if dt > now: return now 
-        if dt.year < 2020: return now
+        if dt > now: return None # Future date = Invalid
+        if dt.year < 2020: return None # Too old = Invalid
+        
         return dt
-    except: return pd.Timestamp.now()
-
-def resize_image_force(image_path):
-    try:
-        with Image.open(image_path) as img:
-            if img.width > 3500 or img.height > 3500:
-                img.thumbnail((3500, 3500), Image.Resampling.LANCZOS)
-                img.save(image_path, optimize=True, quality=80)
-    except: pass
+    except: return None
 
 def clean_json_response(text):
     try:
@@ -172,49 +165,70 @@ def clean_json_response(text):
         return []
     except: return []
 
+# --- VISION ENGINE (QUAD-SCAN) ---
+def smart_slice_image(image_path):
+    """
+    For massive images, split into 4 overlapping quadrants.
+    This keeps the text HUGE so the AI can actually read it.
+    """
+    img = cv2.imread(str(image_path))
+    if img is None: return []
+    h, w = img.shape[:2]
+    
+    # If small enough, just return original
+    if h < 2000 and w < 2000: return [img]
+    
+    slices = []
+    # Midpoints
+    mid_h, mid_w = h // 2, w // 2
+    
+    # Add overlapping buffer (100px) so we don't cut text in half
+    # Top-Left
+    slices.append(img[0:mid_h+100, 0:mid_w+100])
+    # Top-Right
+    slices.append(img[0:mid_h+100, mid_w-100:w])
+    # Bottom-Left
+    slices.append(img[mid_h-100:h, 0:mid_w+100])
+    # Bottom-Right
+    slices.append(img[mid_h-100:h, mid_w-100:w])
+    
+    return slices
+
 # --- AI ENGINE ---
 class AIEngine:
     def __init__(self, api_key):
         self.client = genai.Client(api_key=api_key) if api_key else None
 
-    def analyze_image(self, image_path, mime_type, user_vices, currency):
+    def analyze_image_bytes(self, image_bytes, mime_type, user_vices, currency):
         if not self.client: raise ValueError("No API Key")
-        with open(image_path, "rb") as f: content = f.read()
-
+        
         prompt = f"""
         Role: Senior Forensic Auditor.
-        Task: OCR and categorize transaction lines.
-        JSON STRUCTURE: [{{ "d": "DD/MM/YYYY", "v": "Vendor", "n": "Item Name", "p": 1.00, "c": "£", "mc": "Category", "sc": "SubCategory", "vice": false }}]
+        Task: OCR transaction lines from this receipt section.
+        JSON: [{{ "d": "DD/MM/YYYY", "v": "Vendor", "n": "Item Name", "p": 1.00, "c": "£", "mc": "Category", "sc": "SubCategory", "vice": false }}]
         RULES:
-        1. SCAN ALL. No Totals.
-        2. VENDOR: Header or 'CONT'.
-        3. CATEGORY: [Groceries, Alcohol, Dining, Transport, Shopping, Utilities, Services].
-        4. VICES: {user_vices}.
-        5. CURRENCY: {currency}.
+        1. SCAN ALL visible items.
+        2. IGNORE totals/subtotals.
+        3. VENDOR: If header missing, use 'CONT'.
+        4. CATEGORY: [Groceries, Alcohol, Dining, Transport, Shopping, Utilities, Services].
+        5. VICES: {user_vices}.
+        6. CURRENCY: {currency}.
         """
         
-        # PRIORITY: 1.5 Pro -> 2.0 Flash -> 1.5 Flash
-        models_to_try = [
-            "gemini-1.5-pro",
-            "gemini-2.0-flash", 
-            "gemini-1.5-flash"
-        ]
+        models_to_try = ["gemini-1.5-pro", "gemini-2.0-flash", "gemini-1.5-flash"]
         
         last_error = None
-        for model_name in models_to_try:
+        for model in models_to_try:
             try:
-                print(f"Trying model: {model_name}")
                 res = self.client.models.generate_content(
-                    model=model_name, 
-                    contents=[prompt, types.Part.from_bytes(data=content, mime_type=mime_type)],
+                    model=model, 
+                    contents=[prompt, types.Part.from_bytes(data=image_bytes, mime_type=mime_type)],
                     config=types.GenerateContentConfig(response_mime_type='application/json')
                 )
                 return clean_json_response(res.text)
             except Exception as e:
                 last_error = e
-                # print(f"Model {model_name} failed: {e}") # Log internally
-                continue 
-        
+                continue
         raise last_error
 
 # --- APP LOGIC ---
@@ -273,29 +287,26 @@ def dashboard_screen():
             st.rerun()
 
     st.title("📊 Forensic Dashboard")
+    df = db.get_user_data(st.session_state.user)
     
-    # Safe Load
-    try:
-        df = db.get_user_data(st.session_state.user)
-    except Exception as e:
-        st.error("⚠️ Database error detected. Clearing corrupted data...")
-        db.clear_user_data(st.session_state.user)
-        st.rerun()
-    
+    # METRICS ROW
     if not df.empty:
         c1, c2, c3 = st.columns(3)
         c1.metric("Total Spend", f"{home_curr}{df['Amount'].sum():.2f}")
         c2.metric("Vice Leakage", f"{home_curr}{df[df['Is_Vice']]['Amount'].sum():.2f}")
-        c3.metric("Transactions", len(df))
+        
+        # Missing Date Alert
+        missing_dates = df['Date'].isna().sum()
+        c3.metric("Action Needed", f"{missing_dates} Items", delta="Missing Dates" if missing_dates > 0 else "All Good", delta_color="inverse")
     
-    tab_dash, tab_upload, tab_ledger = st.tabs(["📈 Analytics", "📤 Upload Receipts", "📝 Data Ledger"])
+    tab_dash, tab_upload, tab_ledger = st.tabs(["📈 Executive Analytics", "📤 Upload Receipts", "📝 Data Ledger"])
     
     with tab_upload:
-        uploaded = st.file_uploader("Upload Receipts (Image/PDF)", accept_multiple_files=True)
+        uploaded = st.file_uploader("Upload Receipts", accept_multiple_files=True)
         if uploaded and st.button("🔍 Run Forensic Audit", type="primary"):
             
             if "GEMINI_API_KEY" not in st.secrets:
-                st.error("🚨 Missing API Key. Please configure .streamlit/secrets.toml")
+                st.error("🚨 Missing API Key")
                 st.stop()
                 
             api_key = st.secrets["GEMINI_API_KEY"]
@@ -311,22 +322,29 @@ def dashboard_screen():
                     status_box.write(f"**Processing {i+1}/{len(uploaded)}:** `{f.name}`")
                     with open(tpath, "wb") as file: file.write(f.getbuffer())
                     
-                    if f.type != "application/pdf": resize_image_force(tpath)
+                    items = []
+                    # QUAD-SCAN LOGIC
+                    if f.type != "application/pdf":
+                        # Split image into tiles for high-res scanning
+                        status_box.write(f"  ↳ High-Res Quad Scan (Splitting Image)...")
+                        slices = smart_slice_image(tpath)
+                        for idx, s in enumerate(slices):
+                            _, buf = cv2.imencode(".jpg", s)
+                            status_box.write(f"    - Scanning Quadrant {idx+1}/{len(slices)}...")
+                            chunk_items = ai.analyze_image_bytes(buf.tobytes(), "image/jpeg", vices, home_curr)
+                            items.extend(chunk_items)
+                    else:
+                        # PDF (Send whole)
+                        status_box.write(f"  ↳ Analyzing PDF...")
+                        with open(tpath, "rb") as pdf_file:
+                            items = ai.analyze_image_bytes(pdf_file.read(), "application/pdf", vices, home_curr)
                     
-                    status_box.write(f"  ↳ Scanning... (Using most powerful available model)")
-                    mime = "application/pdf" if f.type == "application/pdf" else "image/jpeg"
-                    
-                    items = ai.analyze_image(tpath, mime, vices, home_curr)
-                    
-                    if not items:
-                        status_box.warning(f"  ⚠️ No items found in {f.name}.")
-                        continue
-                        
                     status_box.write(f"  ✅ Extracted {len(items)} items.")
                     
+                    # Deduplicate logic could go here, but for now simple append
                     for item in items:
                         name = str(item.get("n", "Item"))
-                        blacklist = ["total", "subtotal", "balance", "change", "cash", "due", "visa", "auth", "item", "desc"]
+                        blacklist = ["total", "subtotal", "balance", "change", "cash", "visa", "auth", "item", "desc"]
                         if any(x in name.lower() for x in blacklist): continue
                         
                         price = safe_float(item.get("p"))
@@ -334,7 +352,7 @@ def dashboard_screen():
                         if price > 100 and cat in ["Groceries", "Dining"]: price /= 100.0
                         
                         all_rows.append({
-                            "Date": safe_date(item.get("d")),
+                            "Date": safe_date(item.get("d")), # Returns None if missing
                             "Vendor": item.get("v", "Unknown"),
                             "Item": name,
                             "Amount": price,
@@ -348,7 +366,6 @@ def dashboard_screen():
                     
                 except Exception as e:
                     status_box.error(f"❌ Error on {f.name}: {str(e)}")
-                
                 finally:
                     if os.path.exists(tpath): os.remove(tpath)
                     progress_bar.progress((i + 1) / len(uploaded))
@@ -361,38 +378,84 @@ def dashboard_screen():
                 st.success(f"Successfully audited {len(new_df)} transactions.")
                 time.sleep(1)
                 st.rerun()
-            else:
-                st.warning("Audit finished but no transactions were saved. Check the status log.")
 
     with tab_dash:
         if not df.empty:
+            # Filter Logic
+            min_dt = df['Date'].min().date() if df['Date'].notna().any() else datetime.now().date()
+            max_dt = df['Date'].max().date() if df['Date'].notna().any() else datetime.now().date()
+            if min_dt >= max_dt: min_dt = max_dt - pd.Timedelta(days=1)
+            
+            c_filter1, c_filter2 = st.columns(2)
+            date_range = c_filter1.slider("Filter Date", min_value=min_dt, max_value=max_dt, value=(min_dt, max_dt))
+            all_cats = list(df['Category'].unique())
+            selected_cats = c_filter2.multiselect("Filter Category", all_cats, default=all_cats)
+            
+            # Apply Filters
+            mask = (df['Date'].dt.date >= date_range[0]) & (df['Date'].dt.date <= date_range[1])
+            # Include rows with missing dates in the filter? Usually no, or provide toggle.
+            # For now, let's include valid dates only in timeline, but show all in totals
+            
+            df_filtered = df.loc[mask] if selected_cats else df
+            if selected_cats: df_filtered = df_filtered[df_filtered['Category'].isin(selected_cats)]
+
+            # CHARTS
             domain = ["Groceries", "Alcohol", "Dining", "Transport", "Shopping", "Utilities", "Services", "Unknown"]
             range_ = ["#2ecc71", "#9b59b6", "#e67e22", "#3498db", "#f1c40f", "#95a5a6", "#34495e", "#bdc3c7"]
             
             c1, c2 = st.columns(2)
             with c1:
-                st.subheader("Spending by Category")
-                chart = alt.Chart(df).mark_bar().encode(
-                    x=alt.X('Category', sort='-y'),
-                    y='Amount',
-                    color=alt.Color('Category', scale=alt.Scale(domain=domain, range=range_)),
-                    tooltip=['Category', 'Amount']
-                ).interactive()
+                if len(selected_cats) == 1:
+                    st.subheader(f"🔬 Breakdown: {selected_cats[0]}")
+                    chart = alt.Chart(df_filtered).mark_bar().encode(
+                        x=alt.X('Sub_Category', sort='-y'), y='Amount', color=alt.Color('Sub_Category', legend=None), tooltip=['Item', 'Amount']
+                    ).interactive()
+                else:
+                    st.subheader("💸 Spending by Category")
+                    chart = alt.Chart(df_filtered).mark_bar().encode(
+                        x=alt.X('Category', sort='-y', axis=alt.Axis(labelAngle=-45)), 
+                        y='Amount', 
+                        color=alt.Color('Category', scale=alt.Scale(domain=domain, range=range_)),
+                        tooltip=['Category', 'Amount']
+                    ).interactive()
                 st.altair_chart(chart, use_container_width=True)
             
             with c2:
-                st.subheader("Timeline")
-                line = alt.Chart(df).mark_line(point=True).encode(
-                    x='Date',
-                    y='sum(Amount)',
-                    color='Category',
-                    tooltip=['Date', 'sum(Amount)']
-                ).interactive()
-                st.altair_chart(line, use_container_width=True)
+                st.subheader("😈 Vice Meter")
+                base = alt.Chart(df_filtered).encode(theta=alt.Theta("Amount", stack=True))
+                pie = base.mark_arc(outerRadius=120).encode(
+                    color=alt.Color("Is_Vice", scale=alt.Scale(domain=[True, False], range=["#e74c3c", "#ecf0f1"])),
+                    order=alt.Order("Amount", sort="descending"),
+                    tooltip=["Is_Vice", "Amount"]
+                )
+                text = base.mark_text(radius=140).encode(text=alt.Text("Amount", format=".1f"), order=alt.Order("Amount", sort="descending"), color=alt.value("black"))
+                st.altair_chart(pie + text, use_container_width=True)
+            
+            st.subheader("📈 Financial Heartbeat")
+            # Only chart rows with valid dates
+            df_time = df_filtered.dropna(subset=['Date'])
+            if not df_time.empty:
+                base_line = alt.Chart(df_time).encode(x='Date')
+                area = base_line.mark_area(opacity=0.3).encode(y='sum(Amount)', color=alt.Color('Category', scale=alt.Scale(domain=domain, range=range_)))
+                line = base_line.mark_line().encode(y='sum(Amount)', color=alt.Color('Category', scale=alt.Scale(domain=domain, range=range_)), tooltip=['Date', 'Category', 'sum(Amount)'])
+                st.altair_chart((area + line).interactive(), use_container_width=True)
 
     with tab_ledger:
         if not df.empty:
-            edited_df = st.data_editor(df, num_rows="dynamic", use_container_width=True)
+            # Show "Missing Dates" at top
+            st.info("💡 Pro Tip: Items with missing dates (NaT) will not appear in the timeline. Edit them below.")
+            
+            edited_df = st.data_editor(
+                df, 
+                num_rows="dynamic", 
+                use_container_width=True,
+                column_config={
+                    "Date": st.column_config.DateColumn("Date", format="YYYY-MM-DD", required=False),
+                    "Amount": st.column_config.NumberColumn("Amount", format="%.2f"),
+                    "Is_Vice": st.column_config.CheckboxColumn("Vice?", default=False),
+                    "Category": st.column_config.SelectboxColumn("Category", options=["Groceries", "Alcohol", "Dining", "Transport", "Shopping", "Utilities", "Services"])
+                }
+            )
             if st.button("💾 Save Changes"):
                 db.clear_user_data(st.session_state.user)
                 db.add_transactions(st.session_state.user, edited_df)
