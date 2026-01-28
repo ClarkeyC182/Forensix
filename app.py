@@ -183,12 +183,12 @@ class DatabaseManager:
     def clear_user_data(self, username):
         conn = self._get_conn()
         conn.execute("DELETE FROM transactions WHERE username = ?", (username,))
+        conn.execute("UPDATE users SET gross_income = 0 WHERE username = ?", (username,))
         conn.commit()
         conn.close()
 
 # --- FINANCIAL LOGIC ---
 def calculate_net_monthly(gross, freq, residency):
-    # Normalize to annual
     annual_gross = gross
     if freq == "Monthly": annual_gross = gross * 12
     elif freq == "Weekly": annual_gross = gross * 52
@@ -219,7 +219,7 @@ def calculate_net_monthly(gross, freq, residency):
             else: break
         net_annual = annual_gross - ss - irpf
     else:
-        net_annual = annual_gross * 0.70 # Generic 30% tax
+        net_annual = annual_gross * 0.70 
         
     return net_annual / 12
 
@@ -302,6 +302,9 @@ class AIEngine:
         raise Exception("All AI models failed.")
 
     def generate_financial_advice(self, summary_text):
+        # Fallback Rule-Based Logic (Guaranteed to work if AI fails)
+        fallback_msg = "⚠️ AI Busy. **Basic Analysis:** Your top spending category is dominating your budget. Check the Ledger for specific large items."
+        
         prompt = f"""
         Act as a professional financial consultant.
         Review this spending data.
@@ -309,18 +312,17 @@ class AIEngine:
         Be direct.
         DATA: {summary_text}
         """
-        # UNSTOPPABLE DAISY CHAIN + NO SAFETY FILTERS (Implicit in new library versions or use standard config)
-        models_to_try = ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-1.0-pro"]
+        models_to_try = ["gemini-1.5-flash", "gemini-1.5-pro"]
         
         for model in models_to_try:
             try:
-                # Basic call often bypasses complex safety checks on 'Flash'
                 res = self.client.models.generate_content(model=model, contents=prompt)
                 return res.text
             except Exception as e:
-                print(f"Advice Model {model} failed: {e}")
+                print(f"Advice Error: {e}")
                 continue
-        return "⚠️ AI Advice Unavailable (API Overload). Try again in 1 min."
+                
+        return fallback_msg
 
 # --- APP LOGIC ---
 db = DatabaseManager(DB_PATH)
@@ -355,8 +357,9 @@ def login_screen():
                     else: st.error("Taken")
 
 def dashboard_screen():
-    # RELOAD PROFILE
+    df = db.get_user_data(st.session_state.user)
     profile = db.get_user_profile(st.session_state.user)
+    
     home_curr = profile.get('currency', '£')
     user_residency = profile.get('tax_residency', 'UK')
     user_gross = profile.get('gross_income', 0.0)
@@ -371,8 +374,7 @@ def dashboard_screen():
         st.divider()
         st.subheader("💰 Financial Profile")
         
-        # --- FIXED PROFILE FORM ---
-        with st.container(border=True):
+        with st.form("profile_form", clear_on_submit=False):
             res_options = ["UK (GBP)", "Spain (EUR)", "USA (USD)", "Australia (AUD)", "Canada (CAD)", "Japan (JPY)", "Europe (EUR)"]
             def_idx = 0
             for i, r in enumerate(res_options):
@@ -380,107 +382,90 @@ def dashboard_screen():
             
             new_residency = st.selectbox("Residency", res_options, index=def_idx)
             
-            # Frequency & Amount
             c_p1, c_p2 = st.columns(2)
             new_freq = c_p1.selectbox("Freq", ["Yearly", "Monthly", "Weekly", "Daily"], index=["Yearly", "Monthly", "Weekly", "Daily"].index(user_freq))
-            new_gross = c_p2.number_input("Gross", value=float(user_gross), step=100.0)
+            new_gross = c_p2.number_input("Gross Amount", value=float(user_gross), step=100.0)
             
-            if st.button("💾 Save Profile", use_container_width=True):
+            if st.form_submit_button("💾 Save Profile", use_container_width=True):
                 curr_map = {"GBP": "£", "EUR": "€", "USD": "$", "AUD": "A$", "CAD": "C$", "JPY": "¥"}
                 curr_code = new_residency.split("(")[1].replace(")", "")
                 symbol = curr_map.get(curr_code, curr_code)
-                
                 db.update_user_profile(st.session_state.user, new_gross, new_residency, symbol, new_freq)
                 st.success("Saved!")
                 time.sleep(0.5); st.rerun()
         
         st.divider()
+        vices_input = st.text_area("Vices (Keywords)", "alcohol, candy, betting")
+        
         if st.button("🗑️ Reset All Data"):
             db.clear_user_data(st.session_state.user)
             st.rerun()
 
     st.title("📊 Forensic Dashboard")
     
-    # RELOAD DATA
-    df = db.get_user_data(st.session_state.user)
-    
-    # CALCULATE METRICS
     net_monthly = calculate_net_monthly(user_gross, user_freq, user_residency)
     total_spend = df['Amount'].sum() if not df.empty else 0.0
     vice_spend = df[df['Is_Vice']]['Amount'].sum() if not df.empty else 0.0
     remaining = net_monthly - total_spend
     
-    # METRICS ROW
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Net Monthly Income", f"{home_curr}{net_monthly:,.2f}")
     c2.metric("Total Spend", f"{home_curr}{total_spend:,.2f}")
     c3.metric("Remaining", f"{home_curr}{remaining:,.2f}", delta="Surplus" if remaining > 0 else "Deficit")
     c4.metric("Vice Leakage", f"{home_curr}{vice_spend:,.2f}", delta="Waste", delta_color="inverse")
     
-    # FILTER BAR
     df_chart = pd.DataFrame()
     if not df.empty:
         today = datetime.now()
         start_date = df['Date'].min() if df['Date'].notna().any() else today
         end_date = df['Date'].max() if df['Date'].notna().any() else today
         
-        # TIME BUTTONS
-        with st.expander("📅 Time Travel", expanded=False):
-            t1, t2, t3, t4 = st.columns(4)
-            if t1.button("This Month", use_container_width=True):
-                start_date = today.replace(day=1)
-                end_date = today
-            if t2.button("Last Month", use_container_width=True):
-                first = today.replace(day=1)
-                end_date = first - timedelta(days=1)
-                start_date = end_date.replace(day=1)
-            if t3.button("YTD", use_container_width=True):
-                start_date = today.replace(month=1, day=1)
-                end_date = today
-            if t4.button("All Time", use_container_width=True):
-                start_date = df['Date'].min()
-                end_date = df['Date'].max()
-
-        date_range = (start_date.date(), end_date.date()) if hasattr(start_date, 'date') else (start_date, end_date)
+        with st.expander("🔎 Filter & Timeline Control", expanded=True):
+            cf1, cf2 = st.columns([3, 1])
+            with cf1:
+                date_range = st.slider("Time Range", 
+                    min_value=df['Date'].min().date() if df['Date'].notna().any() else today.date(), 
+                    max_value=df['Date'].max().date() if df['Date'].notna().any() else today.date(),
+                    value=(start_date.date(), end_date.date())
+                )
+            with cf2:
+                st.write("") 
+                if st.button("Reset to All Time", use_container_width=True):
+                    date_range = (df['Date'].min().date(), df['Date'].max().date())
         
         mask = (df['Date'].dt.date >= date_range[0]) & (df['Date'].dt.date <= date_range[1])
         df_chart = df.loc[mask].copy()
 
-    # TABS
     tab_dash, tab_upload, tab_ledger = st.tabs(["📈 Analytics", "📤 Upload", "📝 Ledger"])
     
-    # 1. ANALYTICS
     with tab_dash:
         if not df_chart.empty:
-            # AI INSIGHT
-            if st.button("💡 Generate AI Insight", type="secondary"):
-                with st.spinner("Consulting AI..."):
-                    summary = df_chart.groupby('Category')['Amount'].sum().to_string()
-                    sub_summary = df_chart.groupby('Sub_Category')['Amount'].sum().sort_values(ascending=False).head(5).to_string()
-                    vice_sum = df_chart[df_chart['Is_Vice']]['Amount'].sum()
-                    context = f"Income: {net_monthly}\nTotal Spend: {df_chart['Amount'].sum()}\nVices: {vice_sum}\nBreakdown:\n{summary}\nTop Items:\n{sub_summary}"
-                    api_key = st.secrets["GEMINI_API_KEY"]
-                    st.session_state.ai_advice = AIEngine(api_key).generate_financial_advice(context)
-            
-            if 'ai_advice' in st.session_state:
-                st.info(st.session_state.ai_advice)
+            col_advice, col_btn = st.columns([4, 1])
+            with col_btn:
+                if st.button("💡 Get AI Insight"):
+                    with st.spinner("Analyzing..."):
+                        summary = df_chart.groupby('Category')['Amount'].sum().to_string()
+                        sub_summary = df_chart.groupby('Sub_Category')['Amount'].sum().sort_values(ascending=False).head(5).to_string()
+                        context = f"Income: {net_monthly}\nTotal: {df_chart['Amount'].sum()}\nVices: {vice_spend}\nBreakdown:\n{summary}\nItems:\n{sub_summary}"
+                        api_key = st.secrets["GEMINI_API_KEY"]
+                        st.session_state.ai_advice = AIEngine(api_key).generate_financial_advice(context)
+            with col_advice:
+                if 'ai_advice' in st.session_state: st.info(st.session_state.ai_advice)
 
             st.divider()
+            domain = ["Groceries", "Alcohol", "Dining", "Transport", "Shopping", "Utilities", "Services", "Unknown"]
+            range_ = ["#2ecc71", "#9b59b6", "#e67e22", "#3498db", "#f1c40f", "#95a5a6", "#34495e", "#bdc3c7"]
             
-            # CHART GRID
-            r1c1, r1c2 = st.columns(2)
-            with r1c1:
+            c1, c2 = st.columns(2)
+            with c1:
                 st.subheader("Category Breakdown")
-                domain = ["Groceries", "Alcohol", "Dining", "Transport", "Shopping", "Utilities", "Services", "Unknown"]
-                range_ = ["#2ecc71", "#9b59b6", "#e67e22", "#3498db", "#f1c40f", "#95a5a6", "#34495e", "#bdc3c7"]
                 chart = alt.Chart(df_chart).mark_bar().encode(
                     x=alt.X('Category', sort='-y'), y='Amount', color=alt.Color('Category', scale=alt.Scale(domain=domain, range=range_))
                 ).interactive()
                 st.altair_chart(chart, use_container_width=True)
-            
-            with r1c2:
-                st.subheader("Top Items (Deep Dive)")
-                df_deep = df_chart.groupby('Sub_Category')['Amount'].sum().reset_index().sort_values('Amount', ascending=False).head(8)
+            with c2:
+                st.subheader("Top Sub-Categories")
+                df_deep = df_chart.groupby('Sub_Category')['Amount'].sum().reset_index().sort_values('Amount', ascending=False).head(10)
                 deep_chart = alt.Chart(df_deep).mark_bar().encode(
                     y=alt.Y('Sub_Category', sort='-x'), x='Amount', color=alt.value('#3498db')
                 ).interactive()
@@ -492,14 +477,10 @@ def dashboard_screen():
                 vice_df = df_chart[df_chart['Is_Vice'] == True]
                 if not vice_df.empty:
                     base = alt.Chart(vice_df).encode(theta=alt.Theta("Amount", stack=True))
-                    pie = base.mark_arc(outerRadius=100).encode(
-                        color=alt.Color("Sub_Category", legend=None),
-                        tooltip=["Sub_Category", "Amount"]
-                    )
+                    pie = base.mark_arc(outerRadius=100).encode(color=alt.Color("Sub_Category"), tooltip=["Sub_Category", "Amount"])
                     st.altair_chart(pie, use_container_width=True)
-                else:
-                    st.success("No vices found! Good job.")
-
+                else: st.success("No Vices Found!")
+            
             with r2c2:
                 st.subheader("Spending Timeline")
                 df_valid = df_chart.dropna(subset=['Date'])
@@ -509,7 +490,6 @@ def dashboard_screen():
                     ).interactive()
                     st.altair_chart(line, use_container_width=True)
 
-    # 2. UPLOAD
     with tab_upload:
         uploaded = st.file_uploader("Upload Receipts", accept_multiple_files=True)
         if uploaded and st.button("🔍 Run Forensic Audit", type="primary"):
@@ -527,20 +507,16 @@ def dashboard_screen():
                     
                     items = []
                     if f.type != "application/pdf":
-                        status.write("  ↳ Quad Scan (High Res)...")
                         slices = smart_slice_image(tpath)
                         for idx, s in enumerate(slices):
                             _, buf = cv2.imencode(".jpg", s)
-                            try:
-                                items.extend(ai.analyze_image_bytes(buf.tobytes(), "image/jpeg", "", home_curr))
+                            try: items.extend(ai.analyze_image_bytes(buf.tobytes(), "image/jpeg", vices_input, home_curr))
                             except: continue
                     else:
                         with open(tpath, "rb") as pdf_file:
-                            items.extend(ai.analyze_image_bytes(pdf_file.read(), "application/pdf", "", home_curr))
+                            items.extend(ai.analyze_image_bytes(pdf_file.read(), "application/pdf", vices_input, home_curr))
                     
-                    if not items:
-                        status.warning("  ⚠️ No items found.")
-                        continue
+                    if not items: continue
 
                     receipt_groups = {}
                     for item in items:
@@ -559,16 +535,12 @@ def dashboard_screen():
                         for item in group_items:
                             name = str(item.get("n", "Item"))
                             if any(x in name.lower() for x in ["total", "subtotal", "balance"]): continue
-                            
                             row_date = safe_date(item.get("d"))
                             if not row_date: row_date = group_date
-                            
                             price = safe_float(item.get("p"))
                             cat = item.get("mc", "Shopping")
                             if price > 100 and cat in ["Groceries", "Dining"]: price /= 100.0
-                            
-                            # Auto-Vice (Simple Keyword)
-                            is_vice = any(v in name.lower() for v in ["wine", "beer", "vodka", "candy", "betting", "tobacco"])
+                            is_vice = bool(item.get("vice", False))
                             
                             all_rows.append({
                                 "Date": row_date,
@@ -594,28 +566,27 @@ def dashboard_screen():
                 st.success("Audit Saved!")
                 time.sleep(1); st.rerun()
 
-    # 3. LEDGER (EXCEL STYLE)
     with tab_ledger:
         if not df.empty:
-            # FILTER TOOLBAR
-            with st.container(border=True):
-                fc1, fc2, fc3, fc4 = st.columns(4)
-                f_vend = fc1.multiselect("Vendor", options=df['Vendor'].unique())
-                f_cat = fc2.multiselect("Category", options=df['Category'].unique())
-                f_min = fc3.number_input("Min Amount", value=0.0)
-                f_max = fc4.number_input("Max Amount", value=10000.0)
-            
+            # --- SUPERCHARGED LEDGER ---
+            with st.expander("🛠️ Advanced Filters", expanded=False):
+                cf1, cf2, cf3, cf4 = st.columns(4)
+                sel_vend = cf1.multiselect("Vendor", options=df['Vendor'].unique())
+                sel_cat = cf2.multiselect("Category", options=df['Category'].unique())
+                min_amt = cf3.number_input("Min Amount", value=0.0)
+                max_amt = cf4.number_input("Max Amount", value=10000.0)
+                
             # APPLY
             df_view = df.copy()
-            if f_vend: df_view = df_view[df_view['Vendor'].isin(f_vend)]
-            if f_cat: df_view = df_view[df_view['Category'].isin(f_cat)]
-            df_view = df_view[(df_view['Amount'] >= f_min) & (df_view['Amount'] <= f_max)]
+            if sel_vend: df_view = df_view[df_view['Vendor'].isin(sel_vend)]
+            if sel_cat: df_view = df_view[df_view['Category'].isin(sel_cat)]
+            df_view = df_view[(df_view['Amount'] >= min_amt) & (df_view['Amount'] <= max_amt)]
             
-            # Add Select Col
             df_view.insert(0, "Select", False)
             
-            st.caption(f"Showing {len(df_view)} items")
+            st.caption(f"Showing {len(df_view)} items. Click headers to Sort. Check boxes for Bulk Actions.")
             
+            # THE GRID
             edited_df = st.data_editor(
                 df_view, 
                 num_rows="dynamic", 
@@ -632,31 +603,27 @@ def dashboard_screen():
             # BULK ACTIONS
             selected_ids = edited_df[edited_df['Select'] == True]['id'].astype(str).tolist()
             if selected_ids:
-                st.info(f"⚡ Selected {len(selected_ids)} rows")
-                col_b1, col_b2, col_b3 = st.columns(3)
-                
-                with col_b1:
-                    set_date = st.date_input("Set Date", value=None, key="bulk_date")
+                st.success(f"⚡ {len(selected_ids)} rows selected")
+                b1, b2, b3 = st.columns(3)
+                with b1:
+                    bd = st.date_input("Set Date", value=None)
                     if st.button("Apply Date"):
-                        db.bulk_update_ids(selected_ids, date_val=set_date)
+                        db.bulk_update_ids(selected_ids, date_val=bd)
                         st.rerun()
-                
-                with col_b2:
-                    set_cat = st.selectbox("Set Category", ["Groceries", "Alcohol", "Dining", "Transport", "Shopping"], key="bulk_cat")
+                with b2:
+                    bc = st.selectbox("Set Category", ["Groceries", "Alcohol", "Dining", "Transport", "Shopping"])
                     if st.button("Apply Category"):
-                        db.bulk_update_ids(selected_ids, cat_val=set_cat)
+                        db.bulk_update_ids(selected_ids, cat_val=bc)
                         st.rerun()
-                
-                with col_b3:
-                    if st.button("🗑️ Delete Selected"):
+                with b3:
+                    if st.button("🗑️ Delete Rows"):
                         conn = db._get_conn()
                         ph = ','.join('?' * len(selected_ids))
                         conn.execute(f"DELETE FROM transactions WHERE id IN ({ph})", selected_ids)
-                        conn.commit()
-                        conn.close()
+                        conn.commit(); conn.close()
                         st.rerun()
 
-            if st.button("💾 Save Grid Changes"):
+            if st.button("💾 Save All Manual Edits"):
                 conn = db._get_conn()
                 for i, row in edited_df.iterrows():
                     d_val = row['Date'].strftime('%Y-%m-%d') if pd.notnull(row['Date']) else None
@@ -665,11 +632,10 @@ def dashboard_screen():
                         SET date=?, vendor=?, item=?, amount=?, category=?, sub_category=?, is_vice=?
                         WHERE id=?
                     """, (d_val, row['Vendor'], row['Item'], row['Amount'], row['Category'], row['Sub_Category'], int(row['Is_Vice']), row['id']))
-                conn.commit()
-                conn.close()
+                conn.commit(); conn.close()
                 st.success("Saved!")
-                st.rerun()
+                time.sleep(0.5); st.rerun()
 
 if __name__ == "__main__":
     main()
-
+    
