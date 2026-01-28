@@ -31,7 +31,7 @@ class DatabaseManager:
     def __init__(self, db_path):
         self.db_path = str(db_path)
         self._init_db()
-        self._migrate_db() # Run auto-migration
+        self._migrate_db()
 
     def _get_conn(self):
         return sqlite3.connect(self.db_path, check_same_thread=False)
@@ -39,7 +39,6 @@ class DatabaseManager:
     def _init_db(self):
         conn = self._get_conn()
         c = conn.cursor()
-        # Users Table
         c.execute('''CREATE TABLE IF NOT EXISTS users (
             username TEXT PRIMARY KEY,
             password_hash TEXT NOT NULL,
@@ -48,7 +47,6 @@ class DatabaseManager:
             tax_residency TEXT DEFAULT 'UK',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )''')
-        # Transactions Table
         c.execute('''CREATE TABLE IF NOT EXISTS transactions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT,
@@ -68,14 +66,11 @@ class DatabaseManager:
         conn.close()
 
     def _migrate_db(self):
-        """Self-Healing: Adds missing columns to old databases"""
         conn = self._get_conn()
         c = conn.cursor()
         try:
-            # Check if 'gross_income' exists
             c.execute("SELECT gross_income FROM users LIMIT 1")
         except sqlite3.OperationalError:
-            # Column missing, add it
             c.execute("ALTER TABLE users ADD COLUMN gross_income REAL DEFAULT 0")
             c.execute("ALTER TABLE users ADD COLUMN tax_residency TEXT DEFAULT 'UK'")
             c.execute("ALTER TABLE users ADD COLUMN currency TEXT DEFAULT '£'")
@@ -287,14 +282,14 @@ class AIEngine:
         Focus on 'Discretionary' (Vices) and Sub-Category trends.
         DATA: {summary_text}
         """
-        # USE STABLE MODEL FOR ADVICE (Less prone to 404 on 'Pro')
-        models_to_try = ["gemini-1.5-flash", "gemini-1.5-pro"]
+        # DAISY CHAIN FOR ADVICE
+        models_to_try = ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-1.0-pro"]
         for model in models_to_try:
             try:
                 res = self.client.models.generate_content(model=model, contents=prompt)
                 return res.text
             except: continue
-        return "⚠️ AI Advice Unavailable (API Error)"
+        return "⚠️ AI Advice Unavailable (All models busy/errored)"
 
 # --- APP LOGIC ---
 db = DatabaseManager(DB_PATH)
@@ -329,9 +324,8 @@ def login_screen():
                     else: st.error("Taken")
 
 def dashboard_screen():
-    df = db.get_user_data(st.session_state.user)
+    # RELOAD PROFILE ON EVERY RENDER
     profile = db.get_user_profile(st.session_state.user)
-    
     home_curr = profile.get('currency', '£')
     user_residency = profile.get('tax_residency', 'UK')
     user_gross = profile.get('gross_income', 0.0)
@@ -352,7 +346,7 @@ def dashboard_screen():
                 curr = "£" if "UK" in new_residency else "€" if "Spain" in new_residency else "$"
                 db.update_user_profile(st.session_state.user, new_gross, new_residency, curr)
                 st.success("Updated!")
-                time.sleep(0.5); st.rerun()
+                time.sleep(0.5); st.rerun() # FORCE RERUN TO UPDATE METRICS
         
         st.divider()
         vices = st.text_area("Vices", "alcohol, candy, betting")
@@ -362,11 +356,15 @@ def dashboard_screen():
 
     st.title("📊 Forensic Dashboard")
     
+    # RELOAD DATA
+    df = db.get_user_data(st.session_state.user)
+    
     net_monthly = calculate_net_monthly(user_gross, user_residency)
     total_spend = df['Amount'].sum() if not df.empty else 0.0
     vice_spend = df[df['Is_Vice']]['Amount'].sum() if not df.empty else 0.0
     remaining = net_monthly - total_spend
     
+    # METRICS
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Net Monthly", f"{home_curr}{net_monthly:,.2f}")
     c2.metric("Total Spend", f"{home_curr}{total_spend:,.2f}")
@@ -378,6 +376,7 @@ def dashboard_screen():
         start_date = df['Date'].min() if df['Date'].notna().any() else today
         end_date = df['Date'].max() if df['Date'].notna().any() else today
         
+        # BASIC SLIDER
         cf1, cf2, cf3 = st.columns([2, 1, 1])
         with cf1:
             date_range = st.slider("", 
@@ -399,7 +398,7 @@ def dashboard_screen():
             col_advice, col_btn = st.columns([4, 1])
             with col_btn:
                 if st.button("💡 Generate AI Insight"):
-                    with st.spinner("Analyzing..."):
+                    with st.spinner("Thinking..."):
                         summary = df_chart.groupby('Category')['Amount'].sum().to_string()
                         sub_summary = df_chart.groupby('Sub_Category')['Amount'].sum().sort_values(ascending=False).head(5).to_string()
                         vice_sum = df_chart[df_chart['Is_Vice']]['Amount'].sum()
@@ -520,21 +519,34 @@ def dashboard_screen():
 
     with tab_ledger:
         if not df.empty:
-            st.info("💡 **Pro Tip:** Select rows to Bulk Edit. Use the Search box to Filter. **Ctrl+C / Ctrl+V** works in the table!")
-            
-            # EXCEL-STYLE TOOLS
-            c_tools1, c_tools2 = st.columns([2, 1])
-            search_query = c_tools1.text_input("🔍 Search Ledger (Vendor, Item, Category)", placeholder="e.g. Tesco, Wine...")
-            
-            # Filter Logic
+            # --- TRUE EXCEL FILTERS ---
+            with st.expander("🔎 Filter Ledger"):
+                col_f1, col_f2, col_f3 = st.columns(3)
+                
+                # Filter by Category
+                all_cats = ["All"] + list(df['Category'].unique())
+                sel_cat = col_f1.multiselect("Category", all_cats, default=[])
+                
+                # Filter by Vendor
+                all_vendors = ["All"] + list(df['Vendor'].unique())
+                sel_vend = col_f2.multiselect("Vendor", all_vendors, default=[])
+                
+                # Filter by Missing
+                show_missing = col_f3.checkbox("Show Missing Dates Only")
+                
+            # APPLY FILTERS
             df_view = df.copy()
-            if search_query:
-                # Case insensitive search across all string columns
-                mask = df_view.apply(lambda row: row.astype(str).str.contains(search_query, case=False).any(), axis=1)
-                df_view = df_view[mask]
+            if sel_cat and "All" not in sel_cat:
+                df_view = df_view[df_view['Category'].isin(sel_cat)]
+            if sel_vend and "All" not in sel_vend:
+                df_view = df_view[df_view['Vendor'].isin(sel_vend)]
+            if show_missing:
+                df_view = df_view[df_view['Date'].isna()]
             
             # Select Column
             df_view.insert(0, "Select", False)
+            
+            st.info("💡 **Pro Tip:** Click a cell, then `Ctrl+C` to copy. Select range and `Ctrl+V` to paste.")
             
             edited_df = st.data_editor(
                 df_view, 
@@ -561,25 +573,18 @@ def dashboard_screen():
                         st.success("Updated!")
                         time.sleep(0.5); st.rerun()
                 with col_b2:
-                    new_bulk_cat = st.selectbox("Set Category:", ["(No Change)", "Groceries", "Alcohol", "Dining", "Transport"])
-                    if new_bulk_cat != "(No Change)" and st.button("Apply Category"):
-                        db.bulk_update_ids(selected_ids, cat_val=new_bulk_cat)
-                        st.success("Updated!")
+                    if st.button("🗑️ Delete Selected"):
+                        conn = db._get_conn()
+                        ph = ','.join('?' * len(selected_ids))
+                        conn.execute(f"DELETE FROM transactions WHERE id IN ({ph})", selected_ids)
+                        conn.commit()
+                        conn.close()
+                        st.success("Deleted!")
                         time.sleep(0.5); st.rerun()
 
-            # GLOBAL SAVE
             if st.button("💾 Save All Manual Changes"):
-                # We need to map edits back to DB. For MVP with ID hidden, clearing/replacing subset is risky.
-                # Safer: Delete filtered subset from DB, then re-insert edited version.
-                # For now, simplest robust way: Delete ALL for user, Insert FULL TABLE (assuming user isn't paginated)
-                # But since we are filtering, we can't do full replace easily.
-                # BETTER MVP APPROACH: Only allow bulk actions for now, OR rely on st.data_editor's delta (complex).
-                # Fallback: Just re-save EVERYTHING shown? No, that deletes hidden rows.
-                # Solution: Loop through edited rows and update by ID.
                 conn = db._get_conn()
                 for i, row in edited_df.iterrows():
-                    # Update each row by ID
-                    # This is slow for 1000 rows but fine for MVP
                     d_val = row['Date'].strftime('%Y-%m-%d') if pd.notnull(row['Date']) else None
                     conn.execute("""
                         UPDATE transactions 
@@ -593,4 +598,4 @@ def dashboard_screen():
 
 if __name__ == "__main__":
     main()
-
+    
